@@ -16,7 +16,7 @@ SQLite, and I'll benchmark it on the same VM.**
 | [`seed/make-seed.sh`](seed/make-seed.sh) | Builds the seed database `seed/feed.db` (50k users, 500k posts, 2M likes) and `seed/tokens.json` |
 | [`test/test.sh`](test/test.sh) | The test suite (42 checks). Your server must pass all of them |
 | [`test/run.sh`](test/run.sh) | Builds your submission, starts it on a fresh database copy and runs the tests (what CI runs) |
-| [`bench/`](bench/README.md) | The Goose (Rust) load test we score with, including latency and percentile definitions |
+| [`bench/run.sh`](bench/README.md) | The Goose load-test runner; builds automatically |
 | [`bench/nginx.conf`](bench/nginx.conf) | The Nginx config in front of your server, if you want Nginx (rule 9) |
 
 ## Quick start
@@ -25,8 +25,7 @@ SQLite, and I'll benchmark it on the same VM.**
 bash seed/make-seed.sh                          # needs node >= 18 and sqlite3; about a minute
 mkdir submissions/rust-axum-yourname            # your code + install.sh, build.sh, start.sh, README.md
 bash test/run.sh submissions/rust-axum-yourname # needs curl, jq, openssl
-cargo build --release --locked --manifest-path bench/Cargo.toml # build the optional load generator
-VUS=1000 bench/target/release/feed-load         # optional: load test your server yourself
+VUS=1000 ./bench/run.sh 127.0.0.1 3000           # optional: load test a running server
 ```
 
 ## Rules
@@ -99,7 +98,7 @@ We benchmark each passing submission on the same droplet, with Goose on a
 separate machine. Every implementation in the video ran behind Nginx.
 
 1. **Warm-up**: 1,000 users for 2 minutes (not scored).
-2. **Find the limit**: `bench/target/release/feed-load` starting at 2,500 users, doubling until a run fails, then narrowing
+2. **Find the limit**: `bench/run.sh` starting at 2,500 users, doubling until a run fails, then narrowing
    down to within 250 users.
 3. **Confirm it**: one 5-minute hold at that number. If it fails, step down 250 users and try again.
 

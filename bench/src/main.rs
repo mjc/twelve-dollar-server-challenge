@@ -8,6 +8,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::Path,
     process::ExitCode,
     sync::{
@@ -129,6 +130,18 @@ fn run_duration_s(metrics: &GooseMetrics) -> Option<f64> {
         .map(|duration| duration.as_secs_f64())
 }
 
+fn run_completed(metrics: &GooseMetrics, interrupted: bool) -> bool {
+    !interrupted
+        && metrics
+            .history
+            .last()
+            .is_some_and(|step| matches!(step.action, TestPlanStepAction::Finished))
+        && !metrics
+            .history
+            .iter()
+            .any(|step| matches!(step.action, TestPlanStepAction::Canceling))
+}
+
 fn http_success(status: u16) -> bool {
     // k6's default expected-response range; endpoint checks are separate.
     (200..400).contains(&status)
@@ -148,7 +161,51 @@ async fn think(lo: f64, hi: f64) {
     tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
 }
 
-async fn start_user(user: &mut GooseUser) -> TransactionResult {
+fn parse_source_ips(value: &str) -> Result<Vec<IpAddr>, Box<dyn std::error::Error>> {
+    let mut ips = Vec::new();
+    if value.trim().is_empty() {
+        return Ok(ips);
+    }
+    for entry in value.split(',').map(str::trim) {
+        if let Some((prefix, range)) = entry.split_once(".[") {
+            let range = range.strip_suffix(']').ok_or("invalid SOURCE_IPS range")?;
+            let (first, last) = range.split_once('-').ok_or("invalid SOURCE_IPS range")?;
+            let first: u8 = first.parse()?;
+            let last: u8 = last.parse()?;
+            if first > last {
+                return Err("SOURCE_IPS ranges must be ascending".into());
+            }
+            let prefix = format!("{prefix}.0").parse::<Ipv4Addr>()?.octets();
+            for last_octet in first..=last {
+                ips.push(IpAddr::V4(Ipv4Addr::new(
+                    prefix[0], prefix[1], prefix[2], last_octet,
+                )));
+            }
+        } else {
+            ips.push(entry.parse::<IpAddr>()?);
+        }
+    }
+    for ip in &ips {
+        if ip.is_unspecified()
+            || ip.is_multicast()
+            || matches!(ip, IpAddr::V4(ip) if ip.is_broadcast())
+        {
+            return Err("SOURCE_IPS requires specific unicast IP addresses".into());
+        }
+    }
+    Ok(ips)
+}
+
+fn validate_source_ips(ips: &[IpAddr]) -> Result<(), Box<dyn std::error::Error>> {
+    for ip in ips {
+        // Bind only: no requests, interface changes, or dependency on the target.
+        TcpListener::bind(SocketAddr::new(*ip, 0))
+            .map_err(|error| format!("cannot bind SOURCE_IPS address {ip}: {error}"))?;
+    }
+    Ok(())
+}
+
+async fn configure_client(user: &mut GooseUser, source_ips: &[IpAddr]) -> TransactionResult {
     let timeout = user
         .config
         .timeout
@@ -159,12 +216,15 @@ async fn start_user(user: &mut GooseUser) -> TransactionResult {
     user.set_client_builder(
         reqwest::Client::builder()
             .http1_only()
+            .local_address(
+                (!source_ips.is_empty())
+                    .then(|| source_ips[user.weighted_users_index % source_ips.len()]),
+            )
             .gzip(!user.config.no_gzip)
             .danger_accept_invalid_certs(user.config.accept_invalid_certs)
             .timeout(Duration::from_secs_f64(timeout)),
     )
     .await?;
-    think(0.0, 5.0).await;
     Ok(())
 }
 
@@ -292,7 +352,30 @@ fn load_tokens(path: &Path) -> Result<Vec<Token>, Box<dyn std::error::Error>> {
 }
 
 fn setting(name: &str, default: &str) -> String {
-    env::var(name).unwrap_or_else(|_| default.to_owned())
+    env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_owned())
+}
+
+fn test_plan(vus: usize, ramp_up: &str, duration: &str) -> Result<String, GooseError> {
+    for (name, value) in [("RAMP_UP", ramp_up), ("DURATION", duration)] {
+        if value.trim().is_empty() {
+            return Err(GooseError::InvalidOption {
+                option: name.into(),
+                value: value.into(),
+                detail: "duration must contain a number".into(),
+            });
+        }
+    }
+    let plan = format!("{vus},{ramp_up};{vus},{duration};0,30s");
+    // Validate before set_default, which unwraps an invalid plan in Goose 0.18.1.
+    let parsed: goose::test_plan::TestPlan = plan.parse()?;
+    if parsed.steps[1].1 == 0 {
+        // A zero-length k6 stage is skipped; a zero Goose hold never expires.
+        return Ok(format!("{vus},{ramp_up};0,30s"));
+    }
+    Ok(plan)
 }
 
 async fn run() -> Result<bool, Box<dyn std::error::Error>> {
@@ -302,19 +385,24 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
     if vus == 0 {
         return Err("VUS must be positive".into());
     }
-    let plan = format!(
-        "{vus},{};{vus},{};0,30s",
-        setting("RAMP_UP", "60s"),
-        setting("DURATION", "5m"),
-    );
-    // Validate before set_default, which unwraps an invalid plan in Goose 0.18.1.
-    let _: goose::test_plan::TestPlan = plan.parse()?;
+    let plan = test_plan(vus, &setting("RAMP_UP", "60s"), &setting("DURATION", "5m"))?;
+    let source_ips = Arc::new(parse_source_ips(&setting("SOURCE_IPS", ""))?);
+    validate_source_ips(&source_ips)?;
     let tokens = Arc::new(load_tokens(Path::new(&setting(
         "TOKENS",
-        "seed/tokens.json",
+        "../seed/tokens.json",
     )))?);
     let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
     let runtime_errors = Arc::new(AtomicUsize::new(0));
+    let startup_ips = source_ips.clone();
+    let startup: TransactionFunction = Arc::new(move |user| {
+        let ips = startup_ips.clone();
+        Box::pin(async move {
+            configure_client(user, &ips).await?;
+            think(0.0, 5.0).await;
+            Ok(())
+        })
+    });
     let browse_metrics = metrics.clone();
     let browsing: TransactionFunction = Arc::new(move |user| {
         let tokens = tokens.clone();
@@ -336,12 +424,9 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         .register_scenario(
             scenario!("Feed browser")
                 .register_transaction(
-                    Transaction::new(track_errors(
-                        transaction!(start_user).function,
-                        runtime_errors.clone(),
-                    ))
-                    .set_name("Start user")
-                    .set_on_start(),
+                    Transaction::new(track_errors(startup, runtime_errors.clone()))
+                        .set_name("Start user")
+                        .set_on_start(),
                 )
                 .register_transaction(
                     Transaction::new(track_errors(browsing, runtime_errors.clone()))
@@ -350,14 +435,6 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         )
         .execute()
         .await?;
-    let completed = results
-        .history
-        .last()
-        .is_some_and(|step| matches!(step.action, TestPlanStepAction::Finished))
-        && !results
-            .history
-            .iter()
-            .any(|step| matches!(step.action, TestPlanStepAction::Canceling));
     let mut metrics = metrics.lock().unwrap();
     let mut aggregate = Samples::default();
     let mut endpoints = std::collections::BTreeMap::new();
@@ -369,6 +446,7 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
     }
     let summary = aggregate.summary();
     let runtime_errors = runtime_errors.load(Ordering::Relaxed);
+    let completed = run_completed(&results, goose::is_killswitch_triggered());
     let passed = completed && passes(&summary, runtime_errors);
     let report = serde_json::json!({
         "generator": "goose 0.18.1",
@@ -376,6 +454,7 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         "total_users": results.total_users,
         "duration_s": run_duration_s(&results),
         "hosts": results.hosts,
+        "source_ips": source_ips.as_ref(),
         "latency": "client wall time through complete response body, including connection setup",
         "percentiles": "k6 linear interpolation over unrounded milliseconds",
         "scope": "whole run including ramp-up, hold, ramp-down and drain",
@@ -389,7 +468,7 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
     });
     let output = serde_json::to_string_pretty(&report)?;
     println!("\nScoring summary (full-body latency):\n{output}");
-    let destination = setting("SUMMARY", "results/goose-summary.json");
+    let destination = setting("SUMMARY", "../results/goose-summary.json");
     let path = Path::new(&destination);
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
@@ -418,6 +497,52 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_environment_settings_use_k6_defaults() {
+        let name = "FEED_LOAD_TEST_EMPTY_SETTING";
+        env::remove_var(name);
+        assert_eq!(setting(name, "default"), "default");
+        env::set_var(name, "");
+        assert_eq!(setting(name, "default"), "default");
+        env::set_var(name, "configured");
+        assert_eq!(setting(name, "default"), "configured");
+        env::remove_var(name);
+    }
+
+    #[test]
+    fn zero_hold_is_skipped_instead_of_running_forever() {
+        assert_eq!(test_plan(100, "60s", "5m").unwrap(), "100,60s;100,5m;0,30s");
+        for duration in ["0", "0s", "0m"] {
+            assert_eq!(test_plan(100, "60s", duration).unwrap(), "100,60s;0,30s");
+        }
+        assert!(test_plan(100, "60s", "invalid").is_err());
+        assert!(test_plan(100, "60s", " \t").is_err());
+        assert!(test_plan(100, " ", "5m").is_err());
+    }
+
+    #[test]
+    fn interruption_during_final_shutdown_cannot_pass() {
+        use goose::test_plan::TestPlanHistory;
+        let mut metrics = GooseMetrics::default();
+        assert!(!run_completed(&metrics, false));
+        metrics.history.push(TestPlanHistory {
+            action: TestPlanStepAction::Finished,
+            timestamp: Utc::now(),
+            users: 0,
+        });
+        assert!(run_completed(&metrics, false));
+        assert!(!run_completed(&metrics, true));
+        metrics.history.insert(
+            0,
+            TestPlanHistory {
+                action: TestPlanStepAction::Canceling,
+                timestamp: Utc::now(),
+                users: 1,
+            },
+        );
+        assert!(!run_completed(&metrics, false));
+    }
 
     #[test]
     fn interpolates_k6_percentiles_without_goose_buckets() {
@@ -463,6 +588,114 @@ mod tests {
         for status in [0, 199, 400, 500] {
             assert!(!http_success(status));
         }
+    }
+
+    #[test]
+    fn parses_source_ip_lists_and_inclusive_ipv4_ranges() {
+        assert!(parse_source_ips("  ").unwrap().is_empty());
+        assert_eq!(
+            parse_source_ips("127.0.0.[1-5]").unwrap(),
+            (1..=5)
+                .map(|octet| IpAddr::V4(Ipv4Addr::new(127, 0, 0, octet)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            parse_source_ips("192.0.2.10, 192.0.2.[11-12], ::1, 2001:db8::10").unwrap(),
+            [
+                "192.0.2.10",
+                "192.0.2.11",
+                "192.0.2.12",
+                "::1",
+                "2001:db8::10"
+            ]
+            .map(|ip| ip.parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(parse_source_ips("127.0.0.[255-255]").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rejects_invalid_source_ips_and_ranges() {
+        for value in [
+            "127.0.0.[5-1]",
+            "127.0.0.[1-256]",
+            "127.0.0.[1-5",
+            "127.0.0.[-1-5]",
+            "127.0.0.[1]",
+            "127.0.[1-5]",
+            "127.0.0.1,",
+            "localhost",
+            "0.0.0.0",
+            "::",
+            "224.0.0.1",
+            "ff02::1",
+            "255.255.255.255",
+        ] {
+            assert!(parse_source_ips(value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn binds_users_round_robin_and_preserves_source_on_reconnect() {
+        use std::io::{Read, Write};
+        let ips = parse_source_ips("127.0.0.[1-5]").unwrap();
+        validate_source_ips(&ips).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let expected_ips = ips.clone();
+        let server = std::thread::spawn(move || {
+            // Ten users wrap the five-address list; the last uses OS selection.
+            for index in 0..=10 {
+                let expected = if index < 10 {
+                    expected_ips[index % expected_ips.len()]
+                } else {
+                    "127.0.0.1".parse().unwrap()
+                };
+                for requests in [2, 1] {
+                    let (mut stream, peer) = listener.accept().unwrap();
+                    assert_eq!(peer.ip(), expected);
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    for number in 0..requests {
+                        let mut header = Vec::new();
+                        let mut buffer = [0; 1024];
+                        while !header.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                            let count = stream.read(&mut buffer).unwrap();
+                            assert!(count > 0);
+                            header.extend_from_slice(&buffer[..count]);
+                        }
+                        let connection = if number + 1 == requests {
+                            "close"
+                        } else {
+                            "keep-alive"
+                        };
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: {connection}\r\n\r\nok").unwrap();
+                        stream.flush().unwrap();
+                    }
+                }
+            }
+        });
+        let mut config = goose::config::GooseConfiguration::default();
+        config.timeout = Some("5".into());
+        for index in 0..=10 {
+            let mut user = GooseUser::single(host.parse().unwrap(), &config).unwrap();
+            user.weighted_users_index = index;
+            configure_client(&mut user, if index < 10 { &ips } else { &[] })
+                .await
+                .unwrap();
+            for _ in 0..3 {
+                let response = user
+                    .client
+                    .get(format!("{host}/health"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 200);
+                assert_eq!(response.text().await.unwrap(), "ok");
+            }
+        }
+        server.join().unwrap();
     }
 
     #[test]
