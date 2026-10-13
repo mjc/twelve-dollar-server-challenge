@@ -1,6 +1,8 @@
 use chrono::{SecondsFormat, Utc};
 use goose::{
-    metrics::GooseCoordinatedOmissionMitigation, prelude::*, test_plan::TestPlanStepAction,
+    metrics::{GooseCoordinatedOmissionMitigation, GooseMetrics},
+    prelude::*,
+    test_plan::TestPlanStepAction,
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -8,7 +10,10 @@ use std::{
     env, fs,
     path::Path,
     process::ExitCode,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -88,10 +93,40 @@ fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
     Some(lower + (upper - lower) * rank.fract())
 }
 
-fn passes(summary: &Summary) -> bool {
-    summary.p95_ms.is_some_and(|ms| ms < 500.0)
+fn passes(summary: &Summary, runtime_errors: usize) -> bool {
+    runtime_errors == 0
+        && summary.p95_ms.is_some_and(|ms| ms < 500.0)
         && summary.p99_ms.is_some_and(|ms| ms < 1000.0)
         && summary.failure_rate.is_some_and(|rate| rate < 0.01)
+}
+
+// Goose ignores returned transaction errors, including request-builder errors.
+// Track both startup and browsing errors independently of HTTP samples.
+fn track_errors(
+    function: TransactionFunction,
+    runtime_errors: Arc<AtomicUsize>,
+) -> TransactionFunction {
+    Arc::new(move |user| {
+        let function = function.clone();
+        let runtime_errors = runtime_errors.clone();
+        Box::pin(async move {
+            let result = function(user).await;
+            if result.is_err() {
+                runtime_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            result
+        })
+    })
+}
+
+fn run_duration_s(metrics: &GooseMetrics) -> Option<f64> {
+    // Goose's duration counter stops before it waits for active users to finish.
+    let first = metrics.history.first()?;
+    let last = metrics.history.last()?;
+    (last.timestamp - first.timestamp)
+        .to_std()
+        .ok()
+        .map(|duration| duration.as_secs_f64())
 }
 
 fn http_success(status: u16) -> bool {
@@ -249,6 +284,10 @@ fn load_tokens(path: &Path) -> Result<Vec<Token>, Box<dyn std::error::Error>> {
     {
         return Err("TOKENS must contain a non-empty array of usernames and tokens".into());
     }
+    for token in &tokens {
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.token))
+            .map_err(|_| "TOKENS contains an invalid bearer header value")?;
+    }
     Ok(tokens)
 }
 
@@ -275,6 +314,7 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         "seed/tokens.json",
     )))?);
     let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
+    let runtime_errors = Arc::new(AtomicUsize::new(0));
     let browse_metrics = metrics.clone();
     let browsing: TransactionFunction = Arc::new(move |user| {
         let tokens = tokens.clone();
@@ -295,8 +335,18 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         .set_default(GooseDefault::NoWebSocket, true)?
         .register_scenario(
             scenario!("Feed browser")
-                .register_transaction(transaction!(start_user).set_on_start())
-                .register_transaction(Transaction::new(browsing).set_name("Browse feed")),
+                .register_transaction(
+                    Transaction::new(track_errors(
+                        transaction!(start_user).function,
+                        runtime_errors.clone(),
+                    ))
+                    .set_name("Start user")
+                    .set_on_start(),
+                )
+                .register_transaction(
+                    Transaction::new(track_errors(browsing, runtime_errors.clone()))
+                        .set_name("Browse feed"),
+                ),
         )
         .execute()
         .await?;
@@ -318,12 +368,13 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         endpoints.insert(*endpoint, samples.summary());
     }
     let summary = aggregate.summary();
-    let passed = completed && passes(&summary);
+    let runtime_errors = runtime_errors.load(Ordering::Relaxed);
+    let passed = completed && passes(&summary, runtime_errors);
     let report = serde_json::json!({
         "generator": "goose 0.18.1",
         "maximum_users": results.maximum_users,
         "total_users": results.total_users,
-        "duration_s": results.duration,
+        "duration_s": run_duration_s(&results),
         "hosts": results.hosts,
         "latency": "client wall time through complete response body, including connection setup",
         "percentiles": "k6 linear interpolation over unrounded milliseconds",
@@ -331,6 +382,7 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         "coordinated_omission": "disabled for scoring; real requests only",
         "thresholds": { "p95_ms_lt": 500, "p99_ms_lt": 1000, "failure_rate_lt": 0.01 },
         "completed": completed,
+        "runtime_errors": runtime_errors,
         "passed": passed,
         "aggregate": summary,
         "endpoints": endpoints,
@@ -384,20 +436,20 @@ mod tests {
     #[test]
     fn thresholds_are_strict_and_empty_runs_fail() {
         let mut samples = Samples::default();
-        assert!(!passes(&samples.summary()));
+        assert!(!passes(&samples.summary(), 0));
         samples.latency_ms = vec![10.0; 100];
         samples.failed = 1;
-        assert!(!passes(&samples.summary())); // exactly 1%
+        assert!(!passes(&samples.summary(), 0)); // exactly 1%
         samples.latency_ms.push(10.0);
         let mut summary = samples.summary();
-        assert!(passes(&summary));
+        assert!(passes(&summary, 0));
         summary.p95_ms = Some(500.0);
-        assert!(!passes(&summary));
+        assert!(!passes(&summary, 0));
         summary.p95_ms = Some(499.999);
         summary.p99_ms = Some(1000.0);
-        assert!(!passes(&summary));
+        assert!(!passes(&summary, 0));
         summary.p99_ms = Some(999.999);
-        assert!(passes(&summary));
+        assert!(passes(&summary, 0));
     }
 
     #[test]
@@ -411,6 +463,82 @@ mod tests {
         for status in [0, 199, 400, 500] {
             assert!(!http_success(status));
         }
+    }
+
+    #[test]
+    fn rejects_malformed_bearer_headers_before_loading_users() {
+        let path = env::temp_dir().join(format!("feed-load-tokens-{}.json", std::process::id()));
+        for token in ["valid-token", "bad\ntoken", "bad\rtoken", "bad\0token"] {
+            fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!([
+                    {"username": "test-user", "token": "valid-token"},
+                    {"username": "test-user", "token": token},
+                ]))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(load_tokens(&path).is_ok(), token == "valid-token");
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn suppressed_request_builder_errors_invalidate_healthy_scores() {
+        let mut config = goose::config::GooseConfiguration::default();
+        config.no_metrics = true;
+        let mut user = GooseUser::single("http://127.0.0.1:1".parse().unwrap(), &config).unwrap();
+        let runtime_errors = Arc::new(AtomicUsize::new(0));
+        let function: TransactionFunction = Arc::new(|user| {
+            Box::pin(async move {
+                let metrics: Metrics =
+                    Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
+                let token = Token {
+                    username: "test-user".into(),
+                    token: "bad\ntoken".into(),
+                };
+                request(user, &metrics, 2, "/posts/42/like", Some(&token), None).await?;
+                Ok(())
+            })
+        });
+        let tracked = track_errors(function, runtime_errors.clone());
+        // Bypass preflight to exercise an unexpected runtime construction error.
+        assert!(tracked(&mut user).await.is_err());
+        assert_eq!(runtime_errors.load(Ordering::Relaxed), 1);
+        let mut healthy_samples = Samples {
+            latency_ms: vec![10.0; 100],
+            ..Default::default()
+        };
+        let summary = healthy_samples.summary();
+        assert!(passes(&summary, 0));
+        assert!(!passes(&summary, runtime_errors.load(Ordering::Relaxed)));
+    }
+
+    #[test]
+    fn reported_duration_includes_completion_after_scheduled_stop() {
+        use goose::test_plan::TestPlanHistory;
+        let started = Utc::now();
+        let mut metrics = GooseMetrics::default();
+        assert_eq!(run_duration_s(&metrics), None);
+        metrics.duration = 13;
+        metrics.history = vec![
+            TestPlanHistory {
+                action: TestPlanStepAction::Increasing,
+                timestamp: started,
+                users: 0,
+            },
+            TestPlanHistory {
+                action: TestPlanStepAction::Decreasing,
+                timestamp: started + chrono::TimeDelta::seconds(13),
+                users: 50,
+            },
+            TestPlanHistory {
+                action: TestPlanStepAction::Finished,
+                timestamp: started + chrono::TimeDelta::milliseconds(17448),
+                users: 0,
+            },
+        ];
+        assert_eq!(run_duration_s(&metrics), Some(17.448));
     }
 
     #[tokio::test]

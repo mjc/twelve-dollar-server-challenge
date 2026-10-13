@@ -38,7 +38,8 @@ above for scoring runs; CLI options that change the test plan are for exploratio
 ## Scoring and the k6 differences
 
 The final **Scoring summary** and its JSON file determine the score. Exit status
-is 0 for a pass, 1 for a threshold failure, an interrupted run, or no requests,
+is 0 for a pass, 1 for a threshold failure, an interrupted run, no requests,
+or a startup/browsing transaction error,
 and 2 for configuration/runtime/output errors. Thresholds use the unrounded
 values: aggregate p95 **< 500 ms**, aggregate p99 **< 1,000 ms**, and HTTP failure
 rate **< 0.01**. Equality fails. Failed requests also contribute latency samples.
@@ -48,7 +49,11 @@ percentiles; it does not average endpoint percentiles. Empty endpoint statistics
 are `null`. The report also includes average, median, maximum, request counts,
 HTTP failures, and check failures per endpoint and in aggregate.
 It records the target hosts, maximum and total users, and actual run duration
-alongside the pass/fail result.
+alongside the pass/fail result. `duration_s` spans the recorded start through final
+completion, including any existing shutdown wait; it does not add waiting to the
+run. `runtime_errors` counts unexpected startup/browsing errors separately from
+HTTP failures and must be zero for a pass. Invalid bearer header values in the
+token file are rejected before any users start, with exit status 2.
 
 | Property | Original k6 test | Goose port |
 |---|---|---|
@@ -91,3 +96,6 @@ The tests cover interpolated percentiles, strict threshold boundaries, empty
 runs, and the distinction between HTTP errors and endpoint checks. A local HTTP
 fixture checks delayed bodies, authentication and JSON writes, failed statuses,
 truncated bodies, and refused connections without loading a submission.
+Regression tests reject malformed token headers, prevent request-construction
+errors from passing despite healthy HTTP samples, and ensure reported duration
+includes completion after the scheduled stop.
