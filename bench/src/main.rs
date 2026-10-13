@@ -1,0 +1,539 @@
+use chrono::{SecondsFormat, Utc};
+use goose::{
+    metrics::GooseCoordinatedOmissionMitigation, prelude::*, test_plan::TestPlanStepAction,
+};
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use std::{
+    env, fs,
+    path::Path,
+    process::ExitCode,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+const ENDPOINTS: [&str; 4] = [
+    "GET /feed",
+    "GET /posts/:id",
+    "POST /posts/:id/like",
+    "POST /posts",
+];
+
+#[derive(Deserialize)]
+struct Token {
+    username: String,
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct Feed {
+    posts: Vec<Post>,
+}
+
+#[derive(Deserialize)]
+struct Post {
+    id: u64,
+}
+
+#[derive(Default)]
+struct Samples {
+    // ponytail: retain exact samples, like k6; about 8 MB per million requests.
+    // Use a histogram if longer runs make sample storage a bottleneck.
+    latency_ms: Vec<f64>,
+    failed: usize,
+    checks_failed: usize,
+}
+
+type Metrics = Arc<Mutex<[Samples; 4]>>;
+
+#[derive(Serialize, Debug)]
+struct Summary {
+    requests: usize,
+    failed: usize,
+    failure_rate: Option<f64>,
+    checks_failed: usize,
+    avg_ms: Option<f64>,
+    med_ms: Option<f64>,
+    p95_ms: Option<f64>,
+    p99_ms: Option<f64>,
+    max_ms: Option<f64>,
+}
+
+impl Samples {
+    fn summary(&mut self) -> Summary {
+        self.latency_ms.sort_unstable_by(f64::total_cmp);
+        let requests = self.latency_ms.len();
+        Summary {
+            requests,
+            failed: self.failed,
+            failure_rate: (requests > 0).then(|| self.failed as f64 / requests as f64),
+            checks_failed: self.checks_failed,
+            avg_ms: (requests > 0).then(|| self.latency_ms.iter().sum::<f64>() / requests as f64),
+            med_ms: percentile(&self.latency_ms, 0.5),
+            p95_ms: percentile(&self.latency_ms, 0.95),
+            p99_ms: percentile(&self.latency_ms, 0.99),
+            max_ms: self.latency_ms.last().copied(),
+        }
+    }
+}
+
+// k6 TrendSink.P: linear interpolation at p * (n - 1), not Goose's rounded rank.
+fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rank = p * (sorted.len() - 1) as f64;
+    let lower = sorted[rank.floor() as usize];
+    let upper = sorted[rank.ceil() as usize];
+    Some(lower + (upper - lower) * rank.fract())
+}
+
+fn passes(summary: &Summary) -> bool {
+    summary.p95_ms.is_some_and(|ms| ms < 500.0)
+        && summary.p99_ms.is_some_and(|ms| ms < 1000.0)
+        && summary.failure_rate.is_some_and(|rate| rate < 0.01)
+}
+
+fn http_success(status: u16) -> bool {
+    // k6's default expected-response range; endpoint checks are separate.
+    (200..400).contains(&status)
+}
+
+fn check_success(endpoint: usize, status: u16) -> bool {
+    match endpoint {
+        0 | 1 => status == 200,
+        2 => status == 200 || status == 201,
+        3 => status == 201,
+        _ => unreachable!(),
+    }
+}
+
+async fn think(lo: f64, hi: f64) {
+    let seconds = rand::rng().random_range(lo..hi);
+    tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+}
+
+async fn start_user(user: &mut GooseUser) -> TransactionResult {
+    let timeout = user
+        .config
+        .timeout
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .unwrap_or(60.0);
+    user.set_client_builder(
+        reqwest::Client::builder()
+            .http1_only()
+            .gzip(!user.config.no_gzip)
+            .danger_accept_invalid_certs(user.config.accept_invalid_certs)
+            .timeout(Duration::from_secs_f64(timeout)),
+    )
+    .await?;
+    think(0.0, 5.0).await;
+    Ok(())
+}
+
+// Read every body before stopping the score timer, including errors and writes.
+// Goose's native timer stops at headers and remains useful for diagnostics only.
+async fn request(
+    user: &mut GooseUser,
+    metrics: &Metrics,
+    endpoint: usize,
+    path: &str,
+    auth: Option<&Token>,
+    body: Option<&serde_json::Value>,
+) -> Result<Option<Vec<u8>>, Box<TransactionError>> {
+    let method = if endpoint < 2 {
+        GooseMethod::Get
+    } else {
+        GooseMethod::Post
+    };
+    let mut builder = user.get_request_builder(&method, path)?;
+    if let Some(token) = auth {
+        builder = builder
+            .bearer_auth(&token.token)
+            .header("Content-Type", "application/json");
+    }
+    if let Some(body) = body {
+        builder = builder.json(body);
+    }
+    let goose_request = GooseRequest::builder()
+        .method(method)
+        .path(path)
+        .name(ENDPOINTS[endpoint].split_once(' ').unwrap().1)
+        .set_request_builder(builder)
+        .build();
+    let started = Instant::now();
+    let mut response = user.request(goose_request).await?;
+    let status = response.request.status_code;
+    let bytes = match response.response {
+        Ok(response) => response.bytes().await.ok().map(|bytes| bytes.to_vec()),
+        Err(_) => None,
+    };
+    let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let success = http_success(status) && bytes.is_some();
+    {
+        let mut metrics = metrics.lock().unwrap();
+        let samples = &mut metrics[endpoint];
+        samples.latency_ms.push(latency_ms);
+        samples.failed += usize::from(!success);
+        samples.checks_failed += usize::from(!check_success(endpoint, status) || bytes.is_none());
+    }
+    if success {
+        user.set_success(&mut response.request)?;
+    } else {
+        // set_failure returns a transaction error. Keep browsing after failed
+        // post/like/create requests, as the original k6 loop does.
+        let _ = user.set_failure(
+            "HTTP or response body failure",
+            &mut response.request,
+            None,
+            None,
+        );
+    }
+    Ok(bytes.filter(|_| check_success(endpoint, status)))
+}
+
+async fn browse(user: &mut GooseUser, tokens: &[Token], metrics: &Metrics) -> TransactionResult {
+    let token = &tokens[user.weighted_users_index % tokens.len()];
+    let feed = request(user, metrics, 0, "/feed", None, None).await?;
+    let Some(feed) = feed else {
+        think(3.0, 7.0).await;
+        return Ok(());
+    };
+    let post_id = serde_json::from_slice::<Feed>(&feed)
+        .ok()
+        .filter(|feed| !feed.posts.is_empty() && feed.posts.iter().all(|post| post.id > 0))
+        .map(|feed| feed.posts[rand::rng().random_range(0..feed.posts.len())].id);
+    let Some(post_id) = post_id else {
+        // A malformed/empty feed cannot produce a post request. Surface this as
+        // a check failure without changing k6's HTTP failure definition.
+        metrics.lock().unwrap()[0].checks_failed += 1;
+        think(3.0, 7.0).await;
+        return Ok(());
+    };
+    think(3.0, 7.0).await;
+    request(user, metrics, 1, &format!("/posts/{post_id}"), None, None).await?;
+    think(3.0, 8.0).await;
+    if rand::rng().random_bool(0.15) {
+        request(
+            user,
+            metrics,
+            2,
+            &format!("/posts/{post_id}/like"),
+            Some(token),
+            None,
+        )
+        .await?;
+    }
+    if rand::rng().random_bool(0.02) {
+        let body = serde_json::json!({ "body": format!(
+            "{} says hi at {} (VU {}, iter {})",
+            token.username,
+            Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            user.weighted_users_index + 1,
+            user.get_iterations(),
+        ) });
+        request(user, metrics, 3, "/posts", Some(token), Some(&body)).await?;
+    }
+    think(5.0, 15.0).await;
+    Ok(())
+}
+
+fn load_tokens(path: &Path) -> Result<Vec<Token>, Box<dyn std::error::Error>> {
+    let tokens: Vec<Token> = serde_json::from_slice(&fs::read(path)?)?;
+    if tokens.is_empty()
+        || tokens
+            .iter()
+            .any(|t| t.username.is_empty() || t.token.is_empty())
+    {
+        return Err("TOKENS must contain a non-empty array of usernames and tokens".into());
+    }
+    Ok(tokens)
+}
+
+fn setting(name: &str, default: &str) -> String {
+    env::var(name).unwrap_or_else(|_| default.to_owned())
+}
+
+async fn run() -> Result<bool, Box<dyn std::error::Error>> {
+    // Parse Goose's CLI first so --help works without seed data.
+    let attack = GooseAttack::initialize()?;
+    let vus: usize = setting("VUS", "100").parse()?;
+    if vus == 0 {
+        return Err("VUS must be positive".into());
+    }
+    let plan = format!(
+        "{vus},{};{vus},{};0,30s",
+        setting("RAMP_UP", "60s"),
+        setting("DURATION", "5m"),
+    );
+    // Validate before set_default, which unwraps an invalid plan in Goose 0.18.1.
+    let _: goose::test_plan::TestPlan = plan.parse()?;
+    let tokens = Arc::new(load_tokens(Path::new(&setting(
+        "TOKENS",
+        "seed/tokens.json",
+    )))?);
+    let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
+    let browse_metrics = metrics.clone();
+    let browsing: TransactionFunction = Arc::new(move |user| {
+        let tokens = tokens.clone();
+        let metrics = browse_metrics.clone();
+        Box::pin(async move { browse(user, &tokens, &metrics).await })
+    });
+    let results = attack
+        .set_default(
+            GooseDefault::Host,
+            setting("BASE_URL", "http://127.0.0.1:3000").as_str(),
+        )?
+        .set_default(GooseDefault::TestPlan, plan.as_str())?
+        .set_default(
+            GooseDefault::CoordinatedOmissionMitigation,
+            GooseCoordinatedOmissionMitigation::Disabled,
+        )?
+        .set_default(GooseDefault::NoTelnet, true)?
+        .set_default(GooseDefault::NoWebSocket, true)?
+        .register_scenario(
+            scenario!("Feed browser")
+                .register_transaction(transaction!(start_user).set_on_start())
+                .register_transaction(Transaction::new(browsing).set_name("Browse feed")),
+        )
+        .execute()
+        .await?;
+    let completed = results
+        .history
+        .last()
+        .is_some_and(|step| matches!(step.action, TestPlanStepAction::Finished))
+        && !results
+            .history
+            .iter()
+            .any(|step| matches!(step.action, TestPlanStepAction::Canceling));
+    let mut metrics = metrics.lock().unwrap();
+    let mut aggregate = Samples::default();
+    let mut endpoints = std::collections::BTreeMap::new();
+    for (endpoint, samples) in ENDPOINTS.iter().zip(metrics.iter_mut()) {
+        aggregate.latency_ms.extend_from_slice(&samples.latency_ms);
+        aggregate.failed += samples.failed;
+        aggregate.checks_failed += samples.checks_failed;
+        endpoints.insert(*endpoint, samples.summary());
+    }
+    let summary = aggregate.summary();
+    let passed = completed && passes(&summary);
+    let report = serde_json::json!({
+        "generator": "goose 0.18.1",
+        "maximum_users": results.maximum_users,
+        "total_users": results.total_users,
+        "duration_s": results.duration,
+        "hosts": results.hosts,
+        "latency": "client wall time through complete response body, including connection setup",
+        "percentiles": "k6 linear interpolation over unrounded milliseconds",
+        "scope": "whole run including ramp-up, hold, ramp-down and drain",
+        "coordinated_omission": "disabled for scoring; real requests only",
+        "thresholds": { "p95_ms_lt": 500, "p99_ms_lt": 1000, "failure_rate_lt": 0.01 },
+        "completed": completed,
+        "passed": passed,
+        "aggregate": summary,
+        "endpoints": endpoints,
+    });
+    let output = serde_json::to_string_pretty(&report)?;
+    println!("\nScoring summary (full-body latency):\n{output}");
+    let destination = setting("SUMMARY", "results/goose-summary.json");
+    let path = Path::new(&destination);
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, format!("{output}\n"))?;
+    println!(
+        "{} — summary: {}",
+        if passed { "PASS" } else { "FAIL" },
+        path.display()
+    );
+    Ok(passed)
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(1),
+        Err(error) => {
+            eprintln!("load test error: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interpolates_k6_percentiles_without_goose_buckets() {
+        let mut samples = Samples {
+            latency_ms: vec![1000.1, 499.9, 0.1, 500.1],
+            ..Default::default()
+        };
+        let summary = samples.summary();
+        assert_eq!(summary.med_ms, Some(500.0));
+        assert!((summary.p95_ms.unwrap() - 925.1).abs() < 1e-9);
+        assert!((summary.p99_ms.unwrap() - 985.1).abs() < 1e-9);
+        assert_eq!(percentile(&[], 0.99), None);
+        assert_eq!(percentile(&[0.25], 0.99), Some(0.25));
+    }
+
+    #[test]
+    fn thresholds_are_strict_and_empty_runs_fail() {
+        let mut samples = Samples::default();
+        assert!(!passes(&samples.summary()));
+        samples.latency_ms = vec![10.0; 100];
+        samples.failed = 1;
+        assert!(!passes(&samples.summary())); // exactly 1%
+        samples.latency_ms.push(10.0);
+        let mut summary = samples.summary();
+        assert!(passes(&summary));
+        summary.p95_ms = Some(500.0);
+        assert!(!passes(&summary));
+        summary.p95_ms = Some(499.999);
+        summary.p99_ms = Some(1000.0);
+        assert!(!passes(&summary));
+        summary.p99_ms = Some(999.999);
+        assert!(passes(&summary));
+    }
+
+    #[test]
+    fn http_failures_and_endpoint_checks_have_different_definitions() {
+        assert!(http_success(302));
+        assert!(http_success(204));
+        assert!(!check_success(0, 204));
+        assert!(!check_success(3, 200));
+        assert!(check_success(2, 200));
+        assert!(check_success(2, 201));
+        for status in [0, 199, 400, 500] {
+            assert!(!http_success(status));
+        }
+    }
+
+    #[tokio::test]
+    async fn scores_full_bodies_auth_writes_and_transport_failures() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for (path, status, body) in [
+                ("/feed", "200 OK", r#"{"posts":[{"id":42}]}"#),
+                (
+                    "/posts/42",
+                    "500 Internal Server Error",
+                    r#"{"error":"failed"}"#,
+                ),
+                ("/posts/42/like", "201 Created", r#"{"liked":true}"#),
+                ("/posts", "201 Created", r#"{"post":{"id":43}}"#),
+                ("/feed", "200 OK", "truncated"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut received = Vec::new();
+                let mut chunk = [0; 1024];
+                let header_end = loop {
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert!(count > 0);
+                    received.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8(received[..header_end].to_vec()).unwrap();
+                let headers = headers.to_lowercase();
+                assert!(headers.lines().next().unwrap().contains(path));
+                if path.ends_with("/like") || path == "/posts" {
+                    assert!(headers.contains("authorization: bearer test-token\r\n"));
+                    assert!(headers.contains("content-type: application/json\r\n"));
+                }
+                if path == "/posts" {
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    while received.len() < header_end + length {
+                        let count = stream.read(&mut chunk).unwrap();
+                        assert!(count > 0);
+                        received.extend_from_slice(&chunk[..count]);
+                    }
+                    let json: serde_json::Value =
+                        serde_json::from_slice(&received[header_end..]).unwrap();
+                    assert_eq!(json["body"], "test post");
+                }
+                let length = if body == "truncated" { 100 } else { body.len() };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                stream.flush().unwrap();
+                // Headers arrive first. The scoring latency must include this delay.
+                std::thread::sleep(Duration::from_millis(80));
+                stream.write_all(body.as_bytes()).unwrap();
+            }
+        });
+        let mut config = goose::config::GooseConfiguration::default();
+        config.no_metrics = true;
+        config.co_mitigation = Some(GooseCoordinatedOmissionMitigation::Disabled);
+        let mut user = GooseUser::single(host.parse().unwrap(), &config).unwrap();
+        let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
+        let token = Token {
+            username: "test-user".into(),
+            token: "test-token".into(),
+        };
+        let feed = request(&mut user, &metrics, 0, "/feed", None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Feed>(&feed).unwrap().posts[0].id,
+            42
+        );
+        assert!(request(&mut user, &metrics, 1, "/posts/42", None, None)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            request(&mut user, &metrics, 2, "/posts/42/like", Some(&token), None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(request(
+            &mut user,
+            &metrics,
+            3,
+            "/posts",
+            Some(&token),
+            Some(&serde_json::json!({"body":"test post"}))
+        )
+        .await
+        .unwrap()
+        .is_some());
+        assert!(request(&mut user, &metrics, 0, "/feed", None, None)
+            .await
+            .unwrap()
+            .is_none());
+        server.join().unwrap();
+        // The listener is now closed: connection failures still contribute a sample.
+        assert!(request(&mut user, &metrics, 0, "/feed", None, None)
+            .await
+            .unwrap()
+            .is_none());
+        let metrics = metrics.lock().unwrap();
+        assert_eq!(metrics[0].latency_ms.len(), 3);
+        assert!(metrics[0].latency_ms[0] >= 80.0);
+        assert_eq!(metrics[0].failed, 2);
+        assert_eq!(metrics[0].checks_failed, 2);
+        assert_eq!(metrics[1].failed, 1);
+        assert_eq!(metrics[2].failed, 0);
+        assert_eq!(metrics[3].failed, 0);
+    }
+}

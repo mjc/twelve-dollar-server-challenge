@@ -124,7 +124,7 @@ await writeRows('likes', likeTotal, () => {
   return `${userId}\t${postIdx}\t${ts(postCreatedAt[postIdx - 1] + rand() * 7 * DAY)}`;
 });
 
-// Pre-signed HS256 tokens for the first TOKEN_COUNT users (for bench/load.js). Valid for 10 years.
+// Pre-signed HS256 tokens for the first TOKEN_COUNT users (for the Goose load test). Valid for 10 years.
 const b64url = (s) => Buffer.from(s).toString('base64url');
 const header = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
 const iat = Math.floor(Date.now() / 1000);

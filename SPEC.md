@@ -17,7 +17,7 @@ Listen on `HOST:PORT` and speak HTTP/1.1 with keep-alive. Compression is optiona
 
 - **Behind Nginx** (`bench/nginx.conf`): Nginx keeps up to 64 idle connections to you. Keep idle connections
   open for at least 65 s so Nginx never reuses a socket you just closed.
-- **Direct**: every k6 user holds its own keep-alive connection, so expect up to ~15,000 open connections.
+- **Direct**: every Goose user holds its own keep-alive connection, so expect up to ~15,000 open connections.
   Your service gets `LimitNOFILE=65535` and `CAP_NET_BIND_SERVICE` (it doesn't run as root).
 
 ## Responses

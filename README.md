@@ -16,7 +16,7 @@ SQLite, and I'll benchmark it on the same VM.**
 | [`seed/make-seed.sh`](seed/make-seed.sh) | Builds the seed database `seed/feed.db` (50k users, 500k posts, 2M likes) and `seed/tokens.json` |
 | [`test/test.sh`](test/test.sh) | The test suite (42 checks). Your server must pass all of them |
 | [`test/run.sh`](test/run.sh) | Builds your submission, starts it on a fresh database copy and runs the tests (what CI runs) |
-| [`bench/load.js`](bench/load.js) | The k6 load test we score with (you can test this yourself before submission) |
+| [`bench/`](bench/README.md) | The Goose (Rust) load test we score with, including latency and percentile definitions |
 | [`bench/nginx.conf`](bench/nginx.conf) | The Nginx config in front of your server, if you want Nginx (rule 9) |
 
 ## Quick start
@@ -25,7 +25,8 @@ SQLite, and I'll benchmark it on the same VM.**
 bash seed/make-seed.sh                          # needs node >= 18 and sqlite3; about a minute
 mkdir submissions/rust-axum-yourname            # your code + install.sh, build.sh, start.sh, README.md
 bash test/run.sh submissions/rust-axum-yourname # needs curl, jq, openssl
-k6 run -e VUS=1000 bench/load.js                # optional: load test your server yourself
+cargo build --release --locked --manifest-path bench/Cargo.toml # build the optional load generator
+VUS=1000 bench/target/release/feed-load         # optional: load test your server yourself
 ```
 
 ## Rules
@@ -94,15 +95,21 @@ By submitting, you license your code under the repo's [MIT license](LICENSE).
 
 ## Scoring
 
-We benchmark each passing submission exactly like the languages video: on the same droplet, with k6 on a
+We benchmark each passing submission on the same droplet, with Goose on a
 separate machine. Every implementation in the video ran behind Nginx.
 
 1. **Warm-up**: 1,000 users for 2 minutes (not scored).
-2. **Find the limit**: `bench/load.js` starting at 2,500 users, doubling until a run fails, then narrowing
+2. **Find the limit**: `bench/target/release/feed-load` starting at 2,500 users, doubling until a run fails, then narrowing
    down to within 250 users.
 3. **Confirm it**: one 5-minute hold at that number. If it fails, step down 250 users and try again.
 
 **Your score is the most users that pass a 5-minute hold** with p95 under 500 ms, p99 under 1 s and under 1% errors.
+
+Use the generator's final scoring summary and exit status. As in the original k6
+script, thresholds cover the whole run, including ramp-up and ramp-down. The Goose
+port measures through the full response body and uses k6's percentile interpolation;
+its latency includes connection setup. See [the reporting differences](bench/README.md#scoring-and-the-k6-differences)
+before comparing a new score with historical k6 results.
 
 **After your pull request is merged**, it waits for the next benchmark batch. I run merged submissions in batches,
 not one at a time, on no fixed schedule, and share the results once a batch is done.
