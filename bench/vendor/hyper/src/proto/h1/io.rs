@@ -11,7 +11,7 @@ use futures_core::ready;
 use super::{Http1Transaction, ParseContext, ParsedMessage};
 use crate::common::buf::BufList;
 
-/// The initial buffer size allocated before trying to read from IO.
+/// The initial adaptive read buffer size.
 pub(crate) const INIT_BUFFER_SIZE: usize = 1024;
 
 /// The minimum value that can be set to max buffer size.
@@ -563,7 +563,8 @@ pub(super) struct WriteBuf<B> {
 impl<B: Buf> WriteBuf<B> {
     fn new(strategy: WriteStrategy) -> WriteBuf<B> {
         WriteBuf {
-            headers: Cursor::new(Vec::with_capacity(INIT_BUFFER_SIZE)),
+            // Let encoded headers grow the reusable vec only when a connection writes.
+            headers: Cursor::new(Vec::new()),
             max_buf_size: DEFAULT_MAX_BUFFER_SIZE,
             queue: BufList::new(),
             strategy,
@@ -920,6 +921,7 @@ mod tests {
         let b = |s: &str| Cursor::new(s.as_bytes().to_vec());
 
         let mut write_buf = WriteBuf::<Cursor<Vec<u8>>>::new(WriteStrategy::Flatten);
+        write_buf.headers.bytes.reserve(INIT_BUFFER_SIZE);
 
         write_buf.buffer(b("hello "));
         write_buf.buffer(b("world, "));
@@ -931,7 +933,7 @@ mod tests {
 
         assert_eq!(write_buf.chunk(), b", ");
         assert_eq!(write_buf.headers.pos, 11);
-        assert_eq!(write_buf.headers.bytes.capacity(), INIT_BUFFER_SIZE);
+        assert!(write_buf.headers.bytes.capacity() >= INIT_BUFFER_SIZE);
 
         // there's still room in the headers buffer, so just push on the end
         write_buf.buffer(b("it's hyper!"));
@@ -949,16 +951,21 @@ mod tests {
     }
 
     #[test]
-    fn smaller_initial_buffers_preserve_http1_maximums() {
+    fn lazy_write_headers_preserve_http1_read_and_write_limits() {
         let strategy = ReadStrategy::default();
         let write_buf = WriteBuf::<Cursor<Vec<u8>>>::new(WriteStrategy::Flatten);
 
         assert_eq!(INIT_BUFFER_SIZE, 1024);
         assert_eq!(strategy.next(), 1024);
         assert_eq!(strategy.max(), 8192 + 4096 * 100);
-        assert_eq!(write_buf.headers.bytes.capacity(), 1024);
+        assert_eq!(write_buf.headers.bytes.capacity(), 0);
         assert_eq!(write_buf.max_buf_size, 8192 + 4096 * 100);
         assert_eq!(MINIMUM_MAX_BUFFER_SIZE, 8192);
+
+        let mut scalar = WriteBuf::<Cursor<Vec<u8>>>::new(WriteStrategy::QueueScalar);
+        scalar.buffer(Cursor::new(vec![b'x'; INIT_BUFFER_SIZE * 2]));
+        assert_eq!(scalar.headers.bytes.capacity(), 0);
+        assert_eq!(scalar.queue.remaining(), INIT_BUFFER_SIZE * 2);
 
         let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(Mock::new().build()));
         buffered.set_max_buf_size(MINIMUM_MAX_BUFFER_SIZE);
@@ -1016,8 +1023,11 @@ mod tests {
 
         let mut buffered = Buffered::<_, Bytes>::new(Compat::new(mock));
         buffered.set_write_strategy_queue_scalar();
+        assert_eq!(buffered.write_buf.headers.bytes.capacity(), 0);
         buffered.headers_buf().extend(b"hello ");
+        let header_capacity = buffered.write_buf.headers.bytes.capacity();
         buffered.buffer(body);
+        assert_eq!(buffered.write_buf.headers.bytes.capacity(), header_capacity);
         assert_eq!(buffered.write_buf.queue.bufs_cnt(), 1);
         assert_eq!(buffered.write_buf.queue.chunk().as_ptr(), body_ptr);
 
