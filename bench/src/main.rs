@@ -406,15 +406,19 @@ fn prepare_descriptor_limit(users: usize) -> Result<(), Box<dyn std::error::Erro
         return Err(std::io::Error::last_os_error().into());
     }
     let required = (users as libc::rlim_t).saturating_add(256);
-    if limit.rlim_cur < required {
-        limit.rlim_cur = required.min(limit.rlim_max);
+    let desired = required.max(524_288);
+    if limit.rlim_cur < desired {
+        limit.rlim_cur = desired.min(limit.rlim_max);
         // SAFETY: the pointer is valid and the new soft limit is within the hard limit.
         if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
     }
+    if limit.rlim_cur < desired {
+        eprintln!("Generator descriptor soft limit capped at {}; hard limit prevents reaching {} ({} users plus overhead)", limit.rlim_cur, desired, users);
+    }
     if limit.rlim_cur < required {
-        eprintln!("Generator descriptor limit {} is below {} users plus process overhead; increase its hard limit", limit.rlim_cur, users);
+        return Err(format!("Generator descriptor soft limit {} is below {} users plus process overhead; increase its hard limit before starting the load", limit.rlim_cur, users).into());
     }
     Ok(())
 }

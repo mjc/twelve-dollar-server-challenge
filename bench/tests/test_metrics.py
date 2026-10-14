@@ -42,6 +42,7 @@ class MetricsTests(unittest.TestCase):
         self.source_ports = set()
         self.connection_combinations = set()
         self.in_flight = 0
+        self.requests = 0
         self.observations = []
         self.topology_observations = []
         fixture = self
@@ -70,6 +71,7 @@ class MetricsTests(unittest.TestCase):
             def respond(self, status, body):
                 with fixture.lock:
                     fixture.in_flight += 1
+                    fixture.requests += 1
                 try:
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json")
@@ -128,9 +130,14 @@ class MetricsTests(unittest.TestCase):
                 "--application-pids", str(os.getpid()), "--sample-interval", "0.2",
                 "--output-dir", str(output)]
 
-    def run_benchmark(self, command, *, interrupt_after_failure=False, low_descriptor_limit=False):
+    def run_benchmark(self, command, *, interrupt_after_failure=False, low_descriptor_limit=False,
+                      descriptor_limits=None):
         log = self.root / "coordinator.log"
-        if low_descriptor_limit:
+        if descriptor_limits:
+            command = [sys.executable, "-c",
+                       "import os,resource,sys; resource.setrlimit(resource.RLIMIT_NOFILE, tuple(map(int,sys.argv[1:3]))); os.execv(sys.argv[3],sys.argv[3:])",
+                       *map(str, descriptor_limits), *command]
+        elif low_descriptor_limit:
             # Use a fresh single-threaded interpreter; preexec_fn is unsafe in
             # this process because the HTTP fixture already owns threads.
             command = [sys.executable, "-c",
@@ -320,7 +327,11 @@ class MetricsTests(unittest.TestCase):
             self.assertGreater(report["network"]["lo"]["transmit_packets_per_second"], 0)
         self.assertEqual(target["processes"]["application"]["processes"][0]["pid"], os.getpid())
         generator_limits = generator["processes"]["generator"]["processes"][0]["descriptor_limits"]
-        self.assertGreaterEqual(int(generator_limits["soft"]), 8 + 256)
+        inherited_hard = application_limits[1]
+        expected_generator_limit = (
+            524288 if inherited_hard == resource.RLIM_INFINITY else min(524288, inherited_hard)
+        )
+        self.assertEqual(int(generator_limits["soft"]), expected_generator_limit)
         self.assertEqual(resource.getrlimit(resource.RLIMIT_NOFILE), application_limits)
         application_report_limit = target["processes"]["application"]["processes"][0]["descriptor_limits"]["soft"]
         self.assertEqual(application_report_limit,
@@ -346,6 +357,26 @@ class MetricsTests(unittest.TestCase):
         report = (output / "report.md").read_text()
         self.assertIn("GET /feed", report)
         self.assertIn("p99", report.lower())
+
+    def test_generator_continues_when_hard_limit_caps_descriptor_floor(self):
+        output = self.root / "capped"
+        status, log = self.run_benchmark(self.command(self.server.server_port, output),
+                                         descriptor_limits=(32, 4096))
+        self.assertEqual(status, 0, log)
+        report = json.loads((output / "aggregate.json").read_text())
+        soft = report["generator_telemetry"]["local"]["processes"]["generator"]["processes"][0]["descriptor_limits"]["soft"]
+        self.assertEqual(soft, "4096")
+        output_log = (output / "local" / "output.log").read_text()
+        self.assertIn("capped at 4096", output_log)
+
+    def test_generator_fails_before_load_when_hard_limit_cannot_cover_users(self):
+        output = self.root / "too-low"
+        status, log = self.run_benchmark(self.command(self.server.server_port, output),
+                                         descriptor_limits=(32, 100))
+        self.assertEqual(status, 2, log)
+        self.assertEqual(self.requests, 0)
+        worker_log = (output / "local" / "output.log").read_text()
+        self.assertIn("below 8 users plus process overhead", worker_log)
 
     def test_refused_connections_preserve_failure_rates_and_setup_durations(self):
         # Bind without listening so Linux rejects connects; retain the bound

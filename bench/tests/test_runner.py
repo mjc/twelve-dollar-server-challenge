@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import resource
 import subprocess
 import sys
 import tempfile
@@ -15,7 +16,7 @@ import unittest
 
 RUNNER = Path(__file__).resolve().parents[1] / "run.sh"
 DRIVER = r'''
-import json, os, pathlib, shlex, sys
+import json, os, pathlib, resource, shlex, sys
 args = sys.argv[1:]
 name = pathlib.Path(sys.argv[0]).name
 root = pathlib.Path(os.environ["FIXTURE"])
@@ -32,6 +33,7 @@ elif args and args[0] == "--run-load":
         "cwd": os.getcwd(), "host": os.environ.get("BASE_URL"),
         "tokens": os.environ.get("TOKENS"), "summary": os.environ.get("SUMMARY"),
         "source_ips": os.environ.get("SOURCE_IPS"), "destination_ports": os.environ.get("DESTINATION_PORTS"), "args": args[1:],
+        "nofile": resource.getrlimit(resource.RLIMIT_NOFILE),
     }))
     sys.exit(7)
 elif name == "git":
@@ -97,9 +99,45 @@ class RunnerTests(unittest.TestCase):
         for name in ["TOKENS", "SUMMARY", "BASE_URL", "SOURCE_IPS"]:
             self.env.pop(name, None)
 
-    def run_runner(self, cwd, *args):
-        return subprocess.run([self.env["BASH"], str(self.bench / "run.sh"), *args],
+    def run_runner(self, cwd, *args, limits=None):
+        command = [self.env["BASH"], str(self.bench / "run.sh"), *args]
+        if limits:
+            command = [sys.executable, "-c",
+                       "import os,resource,sys; resource.setrlimit(resource.RLIMIT_NOFILE, tuple(map(int,sys.argv[1:3]))); os.execv(sys.argv[3],sys.argv[3:])",
+                       *map(str, limits), *command]
+        return subprocess.run(command,
                               cwd=cwd, env=self.env, capture_output=True, text=True)
+
+    def test_launcher_raises_soft_limit_and_preserves_hard_limit(self):
+        hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+        if hard == resource.RLIM_INFINITY:
+            hard = 1_000_000
+        if hard < 524288:
+            self.skipTest("host hard limit cannot accommodate the descriptor floor")
+        run = self.run_runner(self.bench, limits=(32, hard))
+        self.assertEqual(run.returncode, 7, run.stderr)
+        soft, actual_hard = json.loads((self.root / "result").read_text())["nofile"]
+        self.assertEqual(soft, 524288)
+        self.assertEqual(actual_hard, hard)
+
+    def test_launcher_preserves_already_higher_soft_limit(self):
+        hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+        if hard == resource.RLIM_INFINITY:
+            hard = 1_000_000
+        if hard < 600000:
+            self.skipTest("host hard limit cannot accommodate the higher soft limit")
+        run = self.run_runner(self.bench, limits=(600000, hard))
+        self.assertEqual(run.returncode, 7, run.stderr)
+        soft, actual_hard = json.loads((self.root / "result").read_text())["nofile"]
+        self.assertEqual(soft, 600000)
+        self.assertEqual(actual_hard, hard)
+
+    def test_launcher_caps_at_hard_limit_and_warns(self):
+        run = self.run_runner(self.bench, limits=(32, 4096))
+        self.assertEqual(run.returncode, 7, run.stderr)
+        soft, hard = json.loads((self.root / "result").read_text())["nofile"]
+        self.assertEqual((soft, hard), (4096, 4096))
+        self.assertIn("capped at hard limit 4096", run.stderr)
 
     def calls(self):
         return [json.loads(line) for line in (self.root / "calls").read_text().splitlines()]

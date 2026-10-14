@@ -72,6 +72,22 @@ if [[ -z ${TOKENS:-} && ! -f ../seed/tokens.json ]]; then
   fi
 fi
 
+# Give the launcher and its local generator a useful descriptor floor. This
+# affects only this process tree; the native generator checks its own limit.
+descriptor_floor=524288
+soft_nofile=$(ulimit -Sn)
+hard_nofile=$(ulimit -Hn)
+if [[ $soft_nofile != unlimited ]] && (( soft_nofile < descriptor_floor )); then
+  if [[ $hard_nofile == unlimited ]] || (( hard_nofile >= descriptor_floor )); then
+    ulimit -S -n "$descriptor_floor"
+  else
+    if (( hard_nofile > soft_nofile )); then
+      ulimit -S -n "$hard_nofile"
+    fi
+    echo "Generator descriptor limit capped at hard limit $hard_nofile; increase it to reach $descriptor_floor" >&2
+  fi
+fi
+
 rust_version=1.99.0
 cargo_command=(cargo)
 rustc_command=(rustc)

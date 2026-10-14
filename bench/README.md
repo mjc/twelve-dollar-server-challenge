@@ -108,11 +108,11 @@ attempt can try several resolved addresses.
 Linux telemetry records per-interface RX/TX throughput and packets per second,
 application/proxy/generator CPU and memory, open descriptors and their limits,
 and established sockets. It also records the observed ephemeral-port and kernel
-limits. Each generator raises its soft descriptor limit, within its existing hard
-limit, to accommodate users and process overhead; an insufficient hard limit is
-reported. Source addresses must already be assigned to that generator. CPU uses
-one core as 100%. FD, memory, and socket peaks are sampled, so
-shorter spikes may be missed.
+limits. The launcher and each generator raise their soft descriptor limit to at
+least 524,288, or as high as the inherited hard limit allows. A generator fails
+before load if its limit cannot cover its users and process overhead. Source
+addresses must already be assigned to that generator. CPU uses one core as
+100%. FD, memory, and socket peaks are sampled, so shorter spikes may be missed.
 
 Interface counters include other traffic on the host. Offloads can change packet
 counts, and virtual interfaces can count the same traffic at several points.
