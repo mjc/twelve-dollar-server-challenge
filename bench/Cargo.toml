@@ -18,4 +18,5 @@ tower = "0.5"
 
 [patch.crates-io]
 goose = { path = "vendor/goose" }
+hyper = { path = "vendor/hyper" }
 hyper-util = { path = "vendor/hyper-util" }

@@ -165,3 +165,8 @@ the retained upstream license are in [the connector patch notes](vendor/hyper-ut
 The [Goose patch](vendor/goose/LOCAL_PATCH.md) allows its HTTP-only build by
 gating the certificate option behind TLS features. The generator rejects HTTPS
 targets and TLS-specific options before launching load.
+
+The [Hyper patch](vendor/hyper/LOCAL-PATCHES.md) starts adaptive HTTP/1 reads at
+1 KiB, allocates write headers on demand and reserves one slot for the first
+queued body. Read buffers still grow for larger responses; HTTP/1 limits remain
+unchanged.
