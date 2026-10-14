@@ -24,7 +24,9 @@ jobs:
       - name: Load generator tests
         run: cargo test --locked --manifest-path bench/Cargo.toml
       - name: Runner tests
-        run: python3 bench/tests/test_runner.py
+        run: |
+          cargo build --locked --manifest-path bench/Cargo.toml
+          FEED_LOAD_BIN=bench/target/debug/feed-load python3 bench/tests/test_runner.py
 
   find:
     runs-on: ubuntu-24.04

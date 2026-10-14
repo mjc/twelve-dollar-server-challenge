@@ -4,7 +4,7 @@ set -euo pipefail
 bench_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd -- "$bench_dir"
 
-usage() { echo "Usage: $0 [IP PORT] [Goose options]" >&2; exit 2; }
+usage() { echo "Usage: $0 [IP PORT] [--user USER] [--output-dir DIR] [Goose options]" >&2; exit 2; }
 
 # Keep BASE_URL and Goose flags available, or accept an explicit target IP/port.
 if [[ $# -gt 0 && $1 != -* ]]; then
@@ -63,4 +63,4 @@ rust_details=$("${rustc_command[@]}" -vV)
 rust_host=${rust_details#*$'\nhost: '}
 rust_host=${rust_host%%$'\n'*}
 "${cargo_command[@]}" build --locked --release --target "$rust_host" --manifest-path "$bench_dir/Cargo.toml" --target-dir "$bench_dir/target"
-exec "$bench_dir/target/$rust_host/release/feed-load" "$@"
+exec "$bench_dir/target/$rust_host/release/feed-load" --orchestrate "$@"

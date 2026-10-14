@@ -8,6 +8,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
+    io::{BufWriter, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::Path,
     process::ExitCode,
@@ -17,6 +18,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+mod runner;
 
 const ENDPOINTS: [&str; 4] = [
     "GET /feed",
@@ -41,7 +44,7 @@ struct Post {
     id: u64,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Samples {
     // ponytail: retain exact samples, like k6; about 8 MB per million requests.
     // Use a histogram if longer runs make sample storage a bottleneck.
@@ -289,8 +292,14 @@ async fn request(
     Ok(bytes.filter(|_| check_success(endpoint, status)))
 }
 
-async fn browse(user: &mut GooseUser, tokens: &[Token], metrics: &Metrics) -> TransactionResult {
-    let token = &tokens[user.weighted_users_index % tokens.len()];
+async fn browse(
+    user: &mut GooseUser,
+    tokens: &[Token],
+    metrics: &Metrics,
+    user_offset: usize,
+) -> TransactionResult {
+    let user_index = user_offset + user.weighted_users_index;
+    let token = &tokens[user_index % tokens.len()];
     let feed = request(user, metrics, 0, "/feed", None, None).await?;
     let Some(feed) = feed else {
         think(3.0, 7.0).await;
@@ -326,7 +335,7 @@ async fn browse(user: &mut GooseUser, tokens: &[Token], metrics: &Metrics) -> Tr
             "{} says hi at {} (VU {}, iter {})",
             token.username,
             Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            user.weighted_users_index + 1,
+            user_index + 1,
             user.get_iterations(),
         ) });
         request(user, metrics, 3, "/posts", Some(token), Some(&body)).await?;
@@ -360,11 +369,11 @@ fn setting(name: &str, default: &str) -> String {
 
 fn test_plan(vus: usize, ramp_up: &str, duration: &str) -> Result<String, GooseError> {
     for (name, value) in [("RAMP_UP", ramp_up), ("DURATION", duration)] {
-        if value.trim().is_empty() {
+        if value.trim().is_empty() || value.contains([',', ';']) {
             return Err(GooseError::InvalidOption {
                 option: name.into(),
                 value: value.into(),
-                detail: "duration must contain a number".into(),
+                detail: "duration must be a single timespan containing a number".into(),
             });
         }
     }
@@ -386,12 +395,19 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         return Err("VUS must be positive".into());
     }
     let plan = test_plan(vus, &setting("RAMP_UP", "60s"), &setting("DURATION", "5m"))?;
+    let stages = plan.parse::<goose::test_plan::TestPlan>()?;
+    let planned_hold_s = if stages.steps.len() == 3 {
+        stages.steps[1].1 / 1000
+    } else {
+        0
+    };
     let source_ips = Arc::new(parse_source_ips(&setting("SOURCE_IPS", ""))?);
     validate_source_ips(&source_ips)?;
     let tokens = Arc::new(load_tokens(Path::new(&setting(
         "TOKENS",
         "../seed/tokens.json",
     )))?);
+    let user_offset: usize = setting("BENCH_USER_OFFSET", "0").parse()?;
     let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
     let runtime_errors = Arc::new(AtomicUsize::new(0));
     let startup_ips = source_ips.clone();
@@ -407,8 +423,17 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let browsing: TransactionFunction = Arc::new(move |user| {
         let tokens = tokens.clone();
         let metrics = browse_metrics.clone();
-        Box::pin(async move { browse(user, &tokens, &metrics).await })
+        Box::pin(async move { browse(user, &tokens, &metrics, user_offset).await })
     });
+    if let Ok(start_at) = env::var("BENCH_START_AT") {
+        let remaining = start_at.parse::<i64>()? - Utc::now().timestamp_millis();
+        if remaining < -250 {
+            return Err("missed coordinated start".into());
+        }
+        if remaining > 0 {
+            tokio::time::sleep(Duration::from_millis(remaining as u64)).await;
+        }
+    }
     let results = attack
         .set_default(
             GooseDefault::Host,
@@ -453,6 +478,11 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         "maximum_users": results.maximum_users,
         "total_users": results.total_users,
         "duration_s": run_duration_s(&results),
+        "started_at": results.history.first().map(|step| step.timestamp),
+        "finished_at": results.history.last().map(|step| step.timestamp),
+        "hold_started_at": results.history.iter().find(|step| matches!(step.action, TestPlanStepAction::Maintaining)).map(|step| step.timestamp),
+        "hold_finished_at": results.history.iter().find(|step| matches!(step.action, TestPlanStepAction::Decreasing)).map(|step| step.timestamp),
+        "planned_hold_s": planned_hold_s,
         "hosts": results.hosts,
         "source_ips": source_ips.as_ref(),
         "latency": "client wall time through complete response body, including connection setup",
@@ -474,6 +504,12 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, format!("{output}\n"))?;
+    if let Ok(destination) = env::var("BENCH_SAMPLES") {
+        // Preserve real samples so distributed percentiles aren't averaged.
+        let mut file = BufWriter::new(fs::File::create(destination)?);
+        serde_json::to_writer(&mut file, &*metrics)?;
+        file.flush()?;
+    }
     println!(
         "{} — summary: {}",
         if passed { "PASS" } else { "FAIL" },
@@ -484,6 +520,62 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| {
+        [
+            "--supervise",
+            "--stop-supervised",
+            "--ready-supervised",
+            "--start-supervised",
+        ]
+        .contains(&arg.as_str())
+    }) {
+        let result = if let Some(path) = args.get(1) {
+            if args[0] == "--supervise" {
+                runner::supervise(Path::new(path), &args[2..])
+            } else if args[0] == "--stop-supervised" {
+                runner::stop_supervised(Path::new(path))
+            } else if args[0] == "--ready-supervised" {
+                runner::ready_supervised(Path::new(path))
+            } else if let Some(timestamp) = args.get(2) {
+                runner::start_supervised(Path::new(path), timestamp)
+            } else {
+                Err("missing coordinated start timestamp".into())
+            }
+        } else {
+            Err("missing supervisor control path".into())
+        };
+        return match result {
+            Ok(code) => ExitCode::from(code),
+            Err(error) => {
+                eprintln!("benchmark supervisor error: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if args.first().is_some_and(|arg| arg == "--orchestrate") {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let mut signal =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    eprintln!("benchmark signal handler error: {error}");
+                    return ExitCode::from(2);
+                }
+            };
+        tokio::spawn(async move {
+            signal.recv().await;
+            flag.store(true, Ordering::Relaxed);
+        });
+        return match runner::run(&args[1..], cancelled) {
+            Ok(code) => ExitCode::from(code),
+            Err(error) => {
+                eprintln!("benchmark runner error: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
     match run().await {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
@@ -519,6 +611,8 @@ mod tests {
         assert!(test_plan(100, "60s", "invalid").is_err());
         assert!(test_plan(100, "60s", " \t").is_err());
         assert!(test_plan(100, " ", "5m").is_err());
+        assert!(test_plan(1, "0s;1,0s", "1s").is_err());
+        assert!(test_plan(1, "0s", "1s;1,0s").is_err());
     }
 
     #[test]

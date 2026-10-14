@@ -1,5 +1,9 @@
 """Exercise the runner with local tool stand-ins; no downloads or load traffic."""
 import json
+import http.server
+import threading
+import time
+import signal
 import os
 from pathlib import Path
 import shlex
@@ -22,6 +26,8 @@ if args and args[0] == "--install-rustup":
     bindir.mkdir(parents=True, exist_ok=True)
     (bindir / "rustup").symlink_to(root / "driver")
 elif args and args[0] == "--run-load":
+    if args[1:2] == ["--orchestrate"]:
+        args.pop(1)
     (root / "result").write_text(json.dumps({
         "cwd": os.getcwd(), "host": os.environ.get("BASE_URL"),
         "tokens": os.environ.get("TOKENS"), "summary": os.environ.get("SUMMARY"),
@@ -148,6 +154,183 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(run.returncode, 2, run.stderr)
                 self.assertIn("Usage:", run.stderr)
         self.assertFalse((self.root / "calls").exists())
+
+
+
+REMOTE_DRIVER = r"""
+import json, os, pathlib, shutil, subprocess, sys, time
+root = pathlib.Path(os.environ["REMOTE_FIXTURE"])
+args = sys.argv[1:]
+name = pathlib.Path(sys.argv[0]).name
+with (root / "calls").open("a") as log:
+    log.write(json.dumps([name, *args]) + "\n")
+def mapped(value):
+    return value.replace("/tmp/feed-load-", str(root / "remote-"))
+if name == "ssh":
+    host, command = args[args.index("--") + 1:]
+    if "--supervise " in command and host.endswith(".2"):
+        time.sleep(float(os.environ.get("START_DELAY", "0")))
+    command = mapped(command)
+    child = subprocess.Popen([os.environ["BASH"], "-c", command], start_new_session=True)
+    stat = pathlib.Path(f"/proc/{child.pid}/stat").read_text().split()[21]
+    with (root / "processes").open("a") as log:
+        log.write(json.dumps([child.pid, stat]) + "\n")
+    sys.exit(child.wait())
+else:
+    paths = args[args.index("--") + 1:]
+    if ":/" in paths[-1]:
+        if os.environ.get("UPLOAD_FAIL") and "@127.0.0.2:" in paths[-1]:
+            sys.exit(9)
+        dest = pathlib.Path(mapped("/" + paths[-1].split(":/", 1)[1]))
+        shutil.copy2(paths[0], dest)
+    else:
+        source = pathlib.Path(mapped("/" + paths[0].split(":/", 1)[1]))
+        dest = pathlib.Path(paths[-1])
+        if os.environ.get("COLLECT_FAIL") and "@127.0.0.2:" in paths[0]:
+            sys.exit(9)
+        shutil.copytree(source, dest, dirs_exist_ok=True)
+"""
+
+
+@unittest.skipUnless(os.environ.get("FEED_LOAD_BIN"), "set FEED_LOAD_BIN to test the built coordinator")
+class CoordinatorTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="goose ssh ")
+        self.root = Path(self.temp.name)
+        self.addCleanup(self.cleanup)
+        self.binary = Path(os.environ["FEED_LOAD_BIN"]).resolve()
+        driver = self.root / "driver"
+        driver.write_text("#!" + sys.executable + "\n" + REMOTE_DRIVER)
+        driver.chmod(0o755)
+        bindir = self.root / "bin"
+        bindir.mkdir()
+        for tool in ["ssh", "scp"]:
+            (bindir / tool).symlink_to(driver)
+        tokens = self.root / "custom tokens.json"
+        tokens.write_text(json.dumps([{"username": "test", "token": "test-token"}]))
+        fixture = self
+        self.requests = 0
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_GET(self):
+                fixture.requests += 1
+                body = json.dumps({"posts": [{"id": 42}]} if self.path == "/feed" else {"post": {"id": 42}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                self.send_response(201)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ["PATH"],
+                        REMOTE_FIXTURE=str(self.root), BASH=shutil.which("bash"),
+                        TOKENS=str(tokens), VUS="2", RAMP_UP="0s", DURATION="1s",
+                        BASE_URL=f"http://127.0.0.1:{self.server.server_port}", SOURCE_IPS="127.0.0.[1-2]")
+        for name in ["SUMMARY", "BENCH_START_AT", "BENCH_USER_OFFSET", "BENCH_SAMPLES"]:
+            self.env.pop(name, None)
+
+    def cleanup(self):
+        if (self.root / "processes").exists():
+            for line in (self.root / "processes").read_text().splitlines():
+                pid, start = json.loads(line)
+                proc = Path(f"/proc/{pid}")
+                try:
+                    command = (proc / "cmdline").read_bytes()
+                    current_start = (proc / "stat").read_text().split()[21]
+                    if current_start == start and str(self.root).encode() in command:
+                        os.killpg(pid, signal.SIGKILL)
+                except (FileNotFoundError, ProcessLookupError):
+                    pass
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.temp.cleanup()
+
+    def command(self, output="results", remote=True, extra=()):
+        return [str(self.binary), "--orchestrate", "--output-dir", str(self.root / output),
+                *(["--user", "bench"] if remote else []), *extra]
+
+    def run_coordinator(self, **kwargs):
+        run = subprocess.run(self.command(**kwargs), env=self.env, cwd=self.root,
+                             capture_output=True, text=True, timeout=95)
+        report = json.loads((self.root / kwargs.get("output", "results") / "aggregate.json").read_text())
+        return run, report
+
+    def test_ssh_barrier_collects_all_reports_and_splits_total_users(self):
+        self.env["START_DELAY"] = "3"
+        run, report = self.run_coordinator(extra=["--request-log", "native.log"])
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr + str(report))
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["maximum_users"], 2)
+        self.assertGreaterEqual(report["common_hold_s"], 0.75)
+        self.assertEqual([w["users"] for w in report["workers"]], [1, 1])
+        self.assertEqual([w["user_offset"] for w in report["workers"]], [0, 1])
+        samples = []
+        for worker in report["workers"]:
+            directory = self.root / "results" / worker["name"]
+            for filename in ["summary.json", "samples.json", "output.log", "native.log"]:
+                self.assertTrue((directory / filename).exists(), filename)
+            samples.extend(ms for endpoint in json.loads((directory / "samples.json").read_text())
+                           for ms in endpoint["latency_ms"])
+        self.assertEqual(report["aggregate"]["requests"], len(samples))
+        rank = 0.99 * (len(samples) - 1)
+        samples.sort()
+        lower = int(rank)
+        expected = samples[lower] + (samples[min(lower + 1, len(samples) - 1)] - samples[lower]) * (rank - lower)
+        self.assertAlmostEqual(report["aggregate"]["p99_ms"], expected)
+
+    def test_failed_upload_never_launches_any_generator(self):
+        self.env["UPLOAD_FAIL"] = "1"
+        run, report = self.run_coordinator()
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertFalse(report["passed"])
+        calls = [json.loads(line) for line in (self.root / "calls").read_text().splitlines()]
+        self.assertFalse(any(call[0] == "ssh" and "--supervise " in call[-1] for call in calls))
+
+    def test_missing_remote_collection_cannot_pass(self):
+        self.env["COLLECT_FAIL"] = "1"
+        run, report = self.run_coordinator()
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertFalse(report["completed"])
+        self.assertFalse(report["passed"])
+
+    def test_local_run_writes_samples_and_native_output_in_directory(self):
+        self.env.update(SOURCE_IPS="127.0.0.[1-2]", SUMMARY=str(self.root / "legacy.json"))
+        run, report = self.run_coordinator(remote=False, extra=["--request-log", "native.log"])
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(report["source_ips"], ["127.0.0.1", "127.0.0.2"])
+        self.assertEqual(report, json.loads((self.root / "legacy.json").read_text()))
+        for filename in ["summary.json", "samples.json", "output.log", "native.log"]:
+            self.assertTrue((self.root / "results" / "local" / filename).exists())
+
+    def test_cancel_stops_remote_supervisors_and_never_passes(self):
+        self.env["DURATION"] = "30s"
+        log = (self.root / "coordinator.log").open("w")
+        with log:
+            process = subprocess.Popen(self.command(), env=self.env, cwd=self.root, stdout=log, stderr=log)
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if self.requests >= 2 and len(list(self.root.glob("remote-*/cancel.ready"))) == 2 and len(list(self.root.glob("remote-*/cancel.start"))) == 2:
+                    break
+                time.sleep(0.1)
+            else:
+                process.wait(timeout=95)
+                self.fail("supervisors did not start")
+            # Own Popen handle retains this live child's identity and start time.
+            process.send_signal(signal.SIGINT)
+            code = process.wait(timeout=35)
+        self.assertNotEqual(code, 0)
+        report = json.loads((self.root / "results" / "aggregate.json").read_text())
+        self.assertFalse(report["passed"])
+        self.assertTrue(report["interrupted"])
+        self.assertEqual(len(list(self.root.glob("remote-*/cancel.done"))), 2)
 
 
 if __name__ == "__main__":
