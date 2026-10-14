@@ -9,6 +9,7 @@ use std::{
     fs::{self, File},
     io::{BufReader, Read},
     net::IpAddr,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -112,8 +113,18 @@ fn checked(cmd: &mut Command, cancelled: &AtomicBool) -> Result<()> {
 }
 
 fn execute(cmd: &mut Command, cancelled: &AtomicBool) -> Result<ExitStatus> {
-    let mut child = cmd.stdin(Stdio::null()).spawn()?;
+    // The coordinator forwards one SIGINT; terminal Ctrl-C must not also reach Goose.
+    let mut child = cmd.stdin(Stdio::null()).process_group(0).spawn()?;
     wait_child(&mut child, cancelled, None)
+}
+
+fn interrupt_child(child: &Child) -> Result<()> {
+    // SAFETY: this is our live, unreaped child; its PID cannot be reused.
+    let result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 fn wait_child(
@@ -122,14 +133,22 @@ fn wait_child(
     timeout: Option<Duration>,
 ) -> Result<ExitStatus> {
     let started = Instant::now();
+    let mut stopping = None;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
         if cancelled.load(Ordering::Relaxed) {
-            // Child is still owned and unreaped, so its PID cannot have been reused.
-            child.kill()?;
-            return Ok(child.wait()?);
+            if timeout.is_none() && stopping.is_none() {
+                interrupt_child(child)?;
+                stopping = Some(Instant::now());
+            }
+            if timeout.is_some()
+                || stopping.is_some_and(|at: Instant| at.elapsed() >= Duration::from_secs(10))
+            {
+                child.kill()?;
+                return Ok(child.wait()?);
+            }
         }
         if timeout.is_some_and(|limit| started.elapsed() >= limit) {
             child.kill()?;
@@ -170,11 +189,7 @@ pub(super) fn supervise(control: &Path, args: &[String]) -> Result<u8> {
             break status;
         }
         if control.exists() && stopping.is_none() {
-            // SAFETY: this is our live, unreaped child; its PID cannot be reused.
-            let result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
-            if result != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
+            interrupt_child(&child)?;
             stopping = Some(Instant::now());
         }
         if stopping.is_some_and(|started| started.elapsed() >= Duration::from_secs(10)) {
@@ -805,5 +820,22 @@ mod tests {
         )
         .unwrap();
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn cancelled_control_children_are_stopped_without_generator_grace() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let status = wait_child(
+            &mut child,
+            &AtomicBool::new(true),
+            Some(Duration::from_secs(120)),
+        )
+        .unwrap();
+        assert!(!status.success());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

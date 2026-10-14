@@ -59,7 +59,7 @@ use their OS's source-address selection.
 Use `VUS`, `RAMP_UP`, and `DURATION` in SSH mode; Goose overrides for users,
 test plans, run time, hatch rate, startup time, iterations, and autostart are rejected.
 
-Interrupting a run stops remote generators, allowing 10 seconds for graceful
+Ctrl-C or SIGTERM stops local and remote generators, allowing 10 seconds for graceful
 cancellation before terminating them if needed, and collects available outputs.
 
 Every run gets a new `../results/run-<timestamp>-<pid>/` directory. Choose another

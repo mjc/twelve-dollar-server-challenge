@@ -556,16 +556,22 @@ async fn main() -> ExitCode {
     if args.first().is_some_and(|arg| arg == "--orchestrate") {
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = cancelled.clone();
-        let mut signal =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-                Ok(signal) => signal,
-                Err(error) => {
-                    eprintln!("benchmark signal handler error: {error}");
-                    return ExitCode::from(2);
-                }
-            };
+        let signals = (
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()),
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()),
+        );
+        let (mut interrupt, mut terminate) = match signals {
+            (Ok(interrupt), Ok(terminate)) => (interrupt, terminate),
+            (Err(error), _) | (_, Err(error)) => {
+                eprintln!("benchmark signal handler error: {error}");
+                return ExitCode::from(2);
+            }
+        };
         tokio::spawn(async move {
-            signal.recv().await;
+            tokio::select! {
+                _ = interrupt.recv() => {},
+                _ = terminate.recv() => {},
+            }
             flag.store(true, Ordering::Relaxed);
         });
         return match runner::run(&args[1..], cancelled) {

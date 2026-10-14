@@ -210,13 +210,14 @@ class CoordinatorTests(unittest.TestCase):
         tokens.write_text(json.dumps([{"username": "test", "token": "test-token"}]))
         fixture = self
         self.requests = 0
+        self.feed_status = 200
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
             def do_GET(self):
                 fixture.requests += 1
                 body = json.dumps({"posts": [{"id": 42}]} if self.path == "/feed" else {"post": {"id": 42}}).encode()
-                self.send_response(200)
+                self.send_response(fixture.feed_status if self.path == "/feed" else 200)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -256,6 +257,17 @@ class CoordinatorTests(unittest.TestCase):
     def command(self, output="results", remote=True, extra=()):
         return [str(self.binary), "--orchestrate", "--output-dir", str(self.root / output),
                 *(["--user", "bench"] if remote else []), *extra]
+
+    def verify_and_signal(self, process, kind, start_time, group=False):
+        proc = Path(f"/proc/{process.pid}")
+        self.assertEqual((proc / "stat").read_text().split()[21], start_time)
+        self.assertEqual((proc / "cmdline").read_bytes().rstrip(b"\0").split(b"\0"),
+                         [arg.encode() for arg in process.args])
+        if group:
+            self.assertEqual(os.getpgid(process.pid), process.pid)
+            os.killpg(process.pid, kind)
+        else:
+            process.send_signal(kind)
 
     def run_coordinator(self, **kwargs):
         run = subprocess.run(self.command(**kwargs), env=self.env, cwd=self.root,
@@ -315,6 +327,7 @@ class CoordinatorTests(unittest.TestCase):
         log = (self.root / "coordinator.log").open("w")
         with log:
             process = subprocess.Popen(self.command(), env=self.env, cwd=self.root, stdout=log, stderr=log)
+            start_time = Path(f"/proc/{process.pid}/stat").read_text().split()[21]
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 if self.requests >= 2 and len(list(self.root.glob("remote-*/cancel.ready"))) == 2 and len(list(self.root.glob("remote-*/cancel.start"))) == 2:
@@ -323,8 +336,57 @@ class CoordinatorTests(unittest.TestCase):
             else:
                 process.wait(timeout=95)
                 self.fail("supervisors did not start")
-            # Own Popen handle retains this live child's identity and start time.
-            process.send_signal(signal.SIGINT)
+            self.verify_and_signal(process, signal.SIGINT, start_time)
+            code = process.wait(timeout=35)
+        self.assertNotEqual(code, 0)
+        report = json.loads((self.root / "results" / "aggregate.json").read_text())
+        self.assertFalse(report["passed"])
+        self.assertTrue(report["interrupted"])
+        self.assertEqual(len(list(self.root.glob("remote-*/cancel.done"))), 2)
+
+    def test_local_interrupt_preserves_collected_samples(self):
+        # Failed feeds finish an iteration within seven seconds, inside the grace period.
+        self.feed_status = 503
+        self.env.update(VUS="1", DURATION="30s")
+        log = (self.root / "coordinator.log").open("w")
+        with log:
+            process = subprocess.Popen(self.command(remote=False), env=self.env, cwd=self.root,
+                                       stdout=log, stderr=log, start_new_session=True)
+            start_time = Path(f"/proc/{process.pid}/stat").read_text().split()[21]
+            deadline = time.monotonic() + 15
+            while self.requests == 0 and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if self.requests == 0:
+                process.wait(timeout=60)
+                self.fail("local generator did not make a request")
+            self.verify_and_signal(process, signal.SIGINT, start_time, group=True)
+            code = process.wait(timeout=15)
+        self.assertEqual(code, 1, (self.root / "coordinator.log").read_text())
+        directory = self.root / "results" / "local"
+        raw = json.loads((directory / "samples.json").read_text())
+        summary = json.loads((directory / "summary.json").read_text())
+        report = json.loads((self.root / "results" / "aggregate.json").read_text())
+        self.assertGreater(summary["aggregate"]["requests"], 0)
+        self.assertEqual(report["aggregate"]["requests"], sum(len(s["latency_ms"]) for s in raw))
+        self.assertFalse(report["passed"])
+        self.assertTrue(report["interrupted"])
+
+    def test_sigterm_stops_remote_supervisors_and_never_passes(self):
+        self.env["DURATION"] = "30s"
+        log = (self.root / "coordinator.log").open("w")
+        with log:
+            process = subprocess.Popen(self.command(), env=self.env, cwd=self.root,
+                                       stdout=log, stderr=log)
+            start_time = Path(f"/proc/{process.pid}/stat").read_text().split()[21]
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if self.requests >= 2 and len(list(self.root.glob("remote-*/cancel.start"))) == 2:
+                    break
+                time.sleep(0.1)
+            else:
+                process.wait(timeout=95)
+                self.fail("remote generators did not make requests")
+            self.verify_and_signal(process, signal.SIGTERM, start_time)
             code = process.wait(timeout=35)
         self.assertNotEqual(code, 0)
         report = json.loads((self.root / "results" / "aggregate.json").read_text())
