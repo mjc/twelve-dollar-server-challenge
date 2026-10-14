@@ -131,6 +131,8 @@ Feed response bodies are consumed and dropped before the user sleeps. HTTP
 pools and sockets remain separate.
 Connections go directly to the supplied target. The generator ignores outbound
 proxy environment variables such as `HTTP_PROXY` and `ALL_PROXY`.
+Goose builds each user's configured client once, at spawn. Pending users occupy
+only scenario indices; that storage is released after the last user starts.
 
 `maximum_users` describes the load stage. Measured established sockets report
 the actual connection concurrency, which can differ during initial jitter,

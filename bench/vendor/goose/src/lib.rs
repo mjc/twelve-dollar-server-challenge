@@ -138,6 +138,14 @@ type UnsequencedTransactions = Vec<Transaction>;
 /// Internal representation of sequenced transactions.
 type SequencedTransactions = BTreeMap<usize, Vec<Transaction>>;
 
+type UserClientFactory =
+    dyn Fn(usize, &GooseConfiguration) -> Result<reqwest::Client, reqwest::Error> + Send + Sync;
+
+enum PendingUsers {
+    Eager(Vec<GooseUser>),
+    Deferred(Vec<usize>),
+}
+
 /// An enumeration of all errors a [`GooseAttack`](./struct.GooseAttack.html) can return.
 #[derive(Debug)]
 pub enum GooseError {
@@ -403,8 +411,10 @@ pub struct GooseAttack {
     scenarios: Vec<Scenario>,
     /// A set of all registered scenario names.
     scenario_machine_names: HashSet<String>,
-    /// A weighted vector containing a GooseUser object for each GooseUser that will run during this load test.
-    weighted_users: Vec<GooseUser>,
+    /// Weighted users, or compact scenario assignments when a client factory is configured.
+    weighted_users: PendingUsers,
+    /// Optional factory supplying each spawned user's independent client.
+    user_client_factory: Option<Arc<UserClientFactory>>,
     /// Optional default values for Goose run-time options.
     defaults: GooseDefaults,
     /// Configuration object holding options set when launching the load test.
@@ -445,7 +455,8 @@ impl GooseAttack {
             test_stop_transaction: None,
             scenarios: Vec::new(),
             scenario_machine_names: HashSet::new(),
-            weighted_users: Vec::new(),
+            weighted_users: PendingUsers::Eager(Vec::new()),
+            user_client_factory: None,
             defaults: GooseDefaults::default(),
             configuration,
             attack_mode: AttackMode::Undefined,
@@ -481,7 +492,8 @@ impl GooseAttack {
             test_stop_transaction: None,
             scenarios: Vec::new(),
             scenario_machine_names: HashSet::new(),
-            weighted_users: Vec::new(),
+            weighted_users: PendingUsers::Eager(Vec::new()),
+            user_client_factory: None,
             defaults: GooseDefaults::default(),
             configuration,
             attack_mode: AttackMode::Undefined,
@@ -493,6 +505,22 @@ impl GooseAttack {
             metrics: GooseMetrics::default(),
             graph_data: GraphData::new(),
         })
+    }
+
+    /// Supply the final client for each user at spawn, without preallocating user clients.
+    ///
+    /// The factory receives the user's zero-based index and resolved configuration.
+    /// Return an independently built client for each user to keep connection pools isolated.
+    /// Without a factory, Goose retains its normal eager client initialization.
+    pub fn set_user_client_factory<F>(mut self, factory: F) -> Self
+    where
+        F: Fn(usize, &GooseConfiguration) -> Result<reqwest::Client, reqwest::Error>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.user_client_factory = Some(Arc::new(factory));
+        self
     }
 
     /// Define the order [`Scenario`](./goose/struct.Scenario.html)s are
@@ -795,10 +823,29 @@ impl GooseAttack {
     }
 
     /// Pre-allocate a vector of weighted [`GooseUser`](./goose/struct.GooseUser.html)s.
-    fn weight_scenario_users(&mut self, total_users: usize) -> Result<Vec<GooseUser>, GooseError> {
+    fn weight_scenario_users(&mut self, total_users: usize) -> Result<PendingUsers, GooseError> {
         trace!("weight_scenario_users");
 
         let weighted_scenarios = self.allocate_scenarios();
+
+        if self.user_client_factory.is_some() {
+            // Preserve early host validation without allocating throwaway clients.
+            for scenarios_index in weighted_scenarios.iter().take(total_users) {
+                goose::get_base_url(
+                    self.get_configuration_host(),
+                    self.scenarios[*scenarios_index].host.clone(),
+                    self.defaults.host.clone(),
+                )?;
+            }
+            return Ok(PendingUsers::Deferred(
+                weighted_scenarios
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(total_users)
+                    .collect(),
+            ));
+        }
 
         // Allocate a state for each user that will be launched.
         info!(
@@ -831,8 +878,39 @@ impl GooseAttack {
                 user_count += 1;
                 if user_count == total_users {
                     debug!("[scheduler]: created {user_count} weighted_users");
-                    return Ok(weighted_users);
+                    return Ok(PendingUsers::Eager(weighted_users));
                 }
+            }
+        }
+    }
+
+    fn pop_user(&mut self) -> Result<GooseUser, GooseError> {
+        match &mut self.weighted_users {
+            PendingUsers::Eager(users) => Ok(users.pop().expect("insufficient weighted_users")),
+            PendingUsers::Deferred(scenarios) => {
+                let index = scenarios.pop().expect("insufficient weighted_users");
+                if scenarios.is_empty() {
+                    // Release even the compact allocation once all users have spawned.
+                    *scenarios = Vec::new();
+                }
+                let scenario = &self.scenarios[index];
+                let base_url = goose::get_base_url(
+                    self.get_configuration_host(),
+                    scenario.host.clone(),
+                    self.defaults.host.clone(),
+                )?;
+                let client = self.user_client_factory.as_ref().unwrap()(
+                    self.metrics.total_users,
+                    &self.configuration,
+                )?;
+                GooseUser::new(
+                    scenario.scenarios_index,
+                    scenario.machine_name.to_string(),
+                    base_url,
+                    &self.configuration,
+                    self.metrics.hash,
+                    Some(client),
+                )
             }
         }
     }
@@ -1383,10 +1461,19 @@ impl GooseAttack {
                     goose_attack_run_state.adjust_user_in_ms,
                 )
             {
-                let mut thread_user = self
-                    .weighted_users
-                    .pop()
-                    .expect("insufficent weighted_users");
+                let mut thread_user = match self.pop_user() {
+                    Ok(user) => user,
+                    Err(error) => {
+                        // Dropping JoinHandles would leave previously spawned load running.
+                        for user in &goose_attack_run_state.users {
+                            user.abort();
+                        }
+                        for user in goose_attack_run_state.users.drain(..) {
+                            let _ = user.await;
+                        }
+                        return Err(error);
+                    }
+                };
                 // Reset the spawn timer.
                 goose_attack_run_state.adjust_user_timer = std::time::Instant::now();
 
@@ -2189,6 +2276,72 @@ fn schedule_unsequenced_transactions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn client_factory_keeps_pending_users_compact_and_releases_storage() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let mut attack = GooseAttack::initialize_with_config(GooseConfiguration::default())
+            .unwrap()
+            .register_scenario(
+                Scenario::new("A")
+                    .set_host("http://127.0.0.1:3000")
+                    .set_weight(2)
+                    .unwrap(),
+            )
+            .register_scenario(Scenario::new("B").set_host("http://127.0.0.1:3001"))
+            .set_user_client_factory(move |index, _| {
+                assert_eq!(counted.fetch_add(1, Ordering::SeqCst), index);
+                reqwest::Client::builder()
+                    .user_agent(format!("user-{index}"))
+                    .build()
+            });
+        attack.weighted_users = attack.weight_scenario_users(75_000).unwrap();
+        match &attack.weighted_users {
+            PendingUsers::Deferred(users) => {
+                assert_eq!(users.len(), 75_000);
+                assert!(users.capacity() * std::mem::size_of::<usize>() <= 600_000);
+            }
+            PendingUsers::Eager(_) => panic!("factory users must not be eagerly allocated"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // Reallocation follows the same weighted LIFO order used by normal Goose.
+        let expected = attack.allocate_scenarios();
+        attack.weighted_users = attack.weight_scenario_users(expected.len()).unwrap();
+        for (index, scenario) in expected.into_iter().rev().enumerate() {
+            attack.metrics.total_users = index;
+            let user = attack.pop_user().unwrap();
+            assert_eq!(user.scenarios_index, scenario);
+        }
+        match &attack.weighted_users {
+            PendingUsers::Deferred(users) => assert_eq!(users.capacity(), 0),
+            PendingUsers::Eager(_) => unreachable!(),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn factory_validates_hosts_early_and_propagates_client_errors() {
+        let mut attack = GooseAttack::initialize_with_config(GooseConfiguration::default())
+            .unwrap()
+            .register_scenario(Scenario::new("A").set_host("invalid host"))
+            .set_user_client_factory(|_, _| {
+                panic!("invalid host must fail before client construction")
+            });
+        assert!(matches!(
+            attack.weight_scenario_users(1),
+            Err(GooseError::InvalidHost { .. })
+        ));
+
+        attack.scenarios[0].host = Some("http://127.0.0.1:3000".into());
+        attack = attack
+            .set_user_client_factory(|_, _| reqwest::Client::builder().user_agent("\n").build());
+        attack.weighted_users = attack.weight_scenario_users(1).unwrap();
+        assert!(matches!(attack.pop_user(), Err(GooseError::Reqwest(_))));
+    }
 
     #[tokio::test]
     async fn test_killswitch_functions() {

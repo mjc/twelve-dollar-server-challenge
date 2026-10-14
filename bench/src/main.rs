@@ -213,34 +213,28 @@ fn validate_source_ips(ips: &[IpAddr]) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-async fn configure_client(
-    user: &mut GooseUser,
+fn build_client(
+    user_index: usize,
+    config: &goose::config::GooseConfiguration,
     source_ips: &[IpAddr],
     connections: Arc<Mutex<connections::Connections>>,
-) -> TransactionResult {
-    let timeout = user
-        .config
+) -> Result<reqwest::Client, reqwest::Error> {
+    let timeout = config
         .timeout
         .as_deref()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
         .unwrap_or(60.0);
-    user.set_client_builder(
-        reqwest::Client::builder()
-            .no_proxy()
-            .http1_only()
-            .pool_idle_timeout(None)
-            .pool_max_idle_per_host(1)
-            .connector_layer(connections::ConnectLayer(connections))
-            .local_address(
-                (!source_ips.is_empty())
-                    .then(|| source_ips[user.weighted_users_index % source_ips.len()]),
-            )
-            .gzip(!user.config.no_gzip)
-            .timeout(Duration::from_secs_f64(timeout)),
-    )
-    .await?;
-    Ok(())
+    reqwest::Client::builder()
+        .no_proxy()
+        .http1_only()
+        .pool_idle_timeout(None)
+        .pool_max_idle_per_host(1)
+        .connector_layer(connections::ConnectLayer(connections))
+        .local_address((!source_ips.is_empty()).then(|| source_ips[user_index % source_ips.len()]))
+        .gzip(!config.no_gzip)
+        .timeout(Duration::from_secs_f64(timeout))
+        .build()
 }
 
 // Read every body before stopping the score timer, including errors and writes.
@@ -485,12 +479,15 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let connection_metrics = Arc::new(Mutex::new(connections::Connections::default()));
     let runtime_errors = Arc::new(AtomicUsize::new(0));
     let startup_ips = source_ips.clone();
-    let startup_connections = connection_metrics.clone();
+    let client_ips = source_ips.clone();
+    let client_connections = connection_metrics.clone();
+    let attack = attack.set_user_client_factory(move |index, config| {
+        build_client(index, config, &client_ips, client_connections.clone())
+    });
     let startup_targets = targets.clone();
     let startup_hosts = assigned_hosts.clone();
     let startup: TransactionFunction = Arc::new(move |user| {
         let ips = startup_ips.clone();
-        let connections = startup_connections.clone();
         let targets = startup_targets.clone();
         let assigned_hosts = startup_hosts.clone();
         Box::pin(async move {
@@ -505,7 +502,6 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
                 .lock()
                 .unwrap()
                 .insert(target.as_str().to_owned());
-            configure_client(user, &ips, connections).await?;
             think(0.0, 5.0).await;
             Ok(())
         })
@@ -775,6 +771,150 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn client_factory_preserves_weighted_users_across_ramp_cycles() {
+        use std::io::Read;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                let mut buffer = [0; 1024];
+                while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    headers.extend_from_slice(&buffer[..count]);
+                }
+                let headers = String::from_utf8(headers).unwrap();
+                let index = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("x-user-index")
+                            .then(|| value.trim())
+                    })
+                    .unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    index.len(),
+                    index
+                )
+                .unwrap();
+            }
+        });
+        let mut config = goose::config::GooseConfiguration::default();
+        config.host = host;
+        config.no_metrics = true;
+        config.no_telnet = true;
+        config.no_websocket = true;
+        let built = Arc::new(Mutex::new(Vec::new()));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let startup = |scenario_index| -> TransactionFunction {
+            let observed = started.clone();
+            Arc::new(move |user| {
+                let observed = observed.clone();
+                Box::pin(async move {
+                    let response = user.client.get(user.build_url("/")?).send().await?;
+                    assert_eq!(
+                        response.text().await?,
+                        user.weighted_users_index.to_string()
+                    );
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push((user.weighted_users_index, scenario_index));
+                    Ok(())
+                })
+            })
+        };
+        let idle: TransactionFunction = Arc::new(|_| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(())
+            })
+        });
+        let construction = built.clone();
+        let attack = GooseAttack::initialize_with_config(config.clone())
+            .unwrap()
+            .set_default(GooseDefault::TestPlan, "4,1s;2,1s;4,1s;0,1s")
+            .unwrap()
+            .set_user_client_factory(move |index, _| {
+                construction.lock().unwrap().push(index);
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("x-user-index", index.to_string().parse().unwrap());
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .default_headers(headers)
+                    .build()
+            });
+        assert!(built.lock().unwrap().is_empty());
+        let metrics = attack
+            .register_scenario(
+                scenario!("A")
+                    .register_transaction(Transaction::new(startup(0)).set_on_start())
+                    .register_transaction(Transaction::new(idle.clone())),
+            )
+            .register_scenario(
+                scenario!("B")
+                    .set_weight(2)
+                    .unwrap()
+                    .register_transaction(Transaction::new(startup(1)).set_on_start())
+                    .register_transaction(Transaction::new(idle)),
+            )
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(*built.lock().unwrap(), vec![0, 1, 2, 3, 4, 5]);
+        let mut started = started.lock().unwrap().clone();
+        started.sort_unstable();
+        assert_eq!(
+            started,
+            vec![(0, 1), (1, 1), (2, 0), (3, 1), (4, 1), (5, 0)]
+        );
+        assert_eq!(metrics.total_users, 6);
+        assert_eq!(metrics.maximum_users, 4);
+        server.join().unwrap();
+
+        // A later factory error must stop users that are already running.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let active = calls.clone();
+        let tick: TransactionFunction = Arc::new(move |_| {
+            let active = active.clone();
+            Box::pin(async move {
+                active.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(())
+            })
+        });
+        let failed = GooseAttack::initialize_with_config(config)
+            .unwrap()
+            .set_default(GooseDefault::TestPlan, "2,1s;0,1s")
+            .unwrap()
+            .set_user_client_factory(|index, _| {
+                let builder = reqwest::Client::builder().no_proxy();
+                if index == 1 {
+                    builder.user_agent("\n").build()
+                } else {
+                    builder.build()
+                }
+            })
+            .register_scenario(
+                scenario!("Factory failure").register_transaction(Transaction::new(tick)),
+            )
+            .execute()
+            .await;
+        assert!(failed.is_err());
+        let stopped = calls.load(Ordering::Relaxed);
+        assert!(stopped > 0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), stopped);
+    }
+
     #[test]
     fn native_metrics_are_enabled_only_for_requested_diagnostics() {
         let mut config = goose::config::GooseConfiguration::default();
@@ -976,12 +1116,12 @@ mod tests {
         for index in 0..=10 {
             let mut user = GooseUser::single(host.parse().unwrap(), &config).unwrap();
             user.weighted_users_index = index;
-            configure_client(
-                &mut user,
+            user.client = build_client(
+                index,
+                &config,
                 if index < 10 { &ips } else { &[] },
                 Arc::new(Mutex::new(connections::Connections::default())),
             )
-            .await
             .unwrap();
             for _ in 0..3 {
                 let response = user

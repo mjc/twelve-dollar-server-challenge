@@ -19,7 +19,21 @@ are retained.
 `default` or `rustls-tls` feature is enabled. Reqwest does not expose that method
 without a TLS backend, so the unconditional call prevented this HTTP benchmark
 from compiling without TLS. TLS-enabled builds preserve the existing certificate
-validation setting. No other Goose behavior is changed.
+validation setting.
 
-Remove this patch when an upstream Goose release supports this build with TLS
-disabled.
+`GooseAttack::set_user_client_factory` is an opt-in hook for providing each user's
+final independent client at spawn. It stores pending users as weighted scenario
+indices, validates their hosts before starting, and releases the pending vector
+after its last entry is consumed. This avoids preallocating full user state and
+clients that the benchmark would immediately replace. Scenario scheduling,
+spawn indices, and controller reallocation follow the existing paths. Without
+the hook, Goose retains its original eager initialization. If client creation
+fails after earlier users have spawned, those tasks are aborted and awaited
+before returning the error so they cannot continue generating load.
+
+Two local unit tests cover compact storage, deferred factory calls, weighted
+spawn order, factory indices, storage release, early host validation, and
+factory error propagation.
+
+Remove these patches when upstream Goose supports the TLS-disabled build and
+equivalent user/client initialization.
