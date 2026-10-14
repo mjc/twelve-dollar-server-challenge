@@ -60,7 +60,7 @@ where
         let strategy = if io.is_write_vectored() {
             WriteStrategy::Queue
         } else {
-            WriteStrategy::Flatten
+            WriteStrategy::QueueScalar
         };
         let write_buf = WriteBuf::new(strategy);
         Buffered {
@@ -79,7 +79,7 @@ where
         debug_assert!(!self.write_buf.has_remaining());
         self.flush_pipeline = enabled;
         if enabled {
-            self.set_write_strategy_flatten();
+            self.write_buf.set_strategy(WriteStrategy::Flatten);
         }
     }
 
@@ -97,18 +97,24 @@ where
         self.read_buf_strategy = ReadStrategy::Exact(sz);
     }
 
-    pub(crate) fn set_write_strategy_flatten(&mut self) {
-        // this should always be called only at construction time,
-        // so this assert is here to catch myself
-        debug_assert_eq!(self.write_buf.queue.bufs_cnt(), 0);
-        self.write_buf.set_strategy(WriteStrategy::Flatten);
-    }
-
     pub(crate) fn set_write_strategy_queue(&mut self) {
         // this should always be called only at construction time,
         // so this assert is here to catch myself
         debug_assert_eq!(self.write_buf.queue.bufs_cnt(), 0);
-        self.write_buf.set_strategy(WriteStrategy::Queue);
+        self.write_buf.set_strategy(if self.flush_pipeline {
+            WriteStrategy::Flatten
+        } else {
+            WriteStrategy::Queue
+        });
+    }
+
+    pub(crate) fn set_write_strategy_queue_scalar(&mut self) {
+        debug_assert_eq!(self.write_buf.queue.bufs_cnt(), 0);
+        self.write_buf.set_strategy(if self.flush_pipeline {
+            WriteStrategy::Flatten
+        } else {
+            WriteStrategy::QueueScalar
+        });
     }
 
     pub(crate) fn read_buf(&self) -> &[u8] {
@@ -284,6 +290,9 @@ where
             if let WriteStrategy::Flatten = self.write_buf.strategy {
                 return self.poll_flush_flattened(cx);
             }
+            if let WriteStrategy::QueueScalar = self.write_buf.strategy {
+                return self.poll_flush_queue_scalar(cx);
+            }
 
             const MAX_WRITEV_BUFS: usize = 64;
             loop {
@@ -309,6 +318,25 @@ where
             }
             Pin::new(&mut self.io).poll_flush(cx)
         }
+    }
+
+    /// Flush owned buffers in order without requiring vectored IO.
+    fn poll_flush_queue_scalar(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            let n = ready!(Pin::new(&mut self.io).poll_write(cx, self.write_buf.chunk()))?;
+            self.write_buf.advance(n);
+            debug!("flushed {} bytes", n);
+            if self.write_buf.remaining() == 0 {
+                break;
+            } else if n == 0 {
+                trace!(
+                    "write returned zero, but {} bytes remaining",
+                    self.write_buf.remaining()
+                );
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+        }
+        Pin::new(&mut self.io).poll_flush(cx)
     }
 
     /// Specialized version of `flush` when strategy is Flatten.
@@ -572,7 +600,7 @@ impl<B: Buf> WriteBuf<B> {
                     buf.advance(adv);
                 }
             }
-            WriteStrategy::Queue => {
+            WriteStrategy::Queue | WriteStrategy::QueueScalar => {
                 trace!(
                     self.len = self.remaining(),
                     buf.len = buf.remaining(),
@@ -586,7 +614,7 @@ impl<B: Buf> WriteBuf<B> {
     fn can_buffer(&self) -> bool {
         match self.strategy {
             WriteStrategy::Flatten => self.remaining() < self.max_buf_size,
-            WriteStrategy::Queue => {
+            WriteStrategy::Queue | WriteStrategy::QueueScalar => {
                 self.queue.bufs_cnt() < MAX_BUF_LIST_BUFFERS && self.remaining() < self.max_buf_size
             }
         }
@@ -649,6 +677,7 @@ impl<B: Buf> Buf for WriteBuf<B> {
 enum WriteStrategy {
     Flatten,
     Queue,
+    QueueScalar,
 }
 
 #[cfg(test)]
@@ -970,6 +999,129 @@ mod tests {
         buffered.flush().await.expect("flush");
 
         assert_eq!(buffered.write_buf.queue.bufs_cnt(), 0);
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn write_buf_queue_scalar_preserves_order_across_partial_writes_and_pending() {
+        let body = Bytes::from_static(b"world");
+        let body_ptr = body.as_ptr();
+        let mock = Mock::new()
+            .write(b"he")
+            .wait(Duration::from_millis(1))
+            .write(b"llo ")
+            .write(b"wor")
+            .write(b"ld")
+            .build();
+
+        let mut buffered = Buffered::<_, Bytes>::new(Compat::new(mock));
+        buffered.set_write_strategy_queue_scalar();
+        buffered.headers_buf().extend(b"hello ");
+        buffered.buffer(body);
+        assert_eq!(buffered.write_buf.queue.bufs_cnt(), 1);
+        assert_eq!(buffered.write_buf.queue.chunk().as_ptr(), body_ptr);
+
+        buffered.flush().await.expect("flush");
+        assert_eq!(buffered.write_buf.remaining(), 0);
+    }
+
+    #[derive(Clone)]
+    struct ScalarWriter {
+        output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        max_write: usize,
+        write_zero: bool,
+    }
+
+    impl tokio::io::AsyncRead for ScalarWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for ScalarWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if this.write_zero {
+                return Poll::Ready(Ok(0));
+            }
+            let len = buf.len().min(this.max_write);
+            this.output.lock().unwrap().extend_from_slice(&buf[..len]);
+            Poll::Ready(Ok(len))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            panic!("scalar queue must not call poll_write_vectored");
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn write_buf_queue_scalar_uses_only_scalar_writes_and_detects_write_zero() {
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = ScalarWriter {
+            output: output.clone(),
+            max_write: 2,
+            write_zero: false,
+        };
+        let mut buffered = Buffered::<_, Bytes>::new(Compat::new(writer));
+        buffered.set_write_strategy_queue_scalar();
+        buffered.headers_buf().extend(b"headers");
+        buffered.buffer(Bytes::from_static(b"body"));
+        buffered.flush().await.expect("partial scalar writes");
+        assert_eq!(&*output.lock().unwrap(), b"headersbody");
+
+        let writer = ScalarWriter {
+            output: Default::default(),
+            max_write: 2,
+            write_zero: true,
+        };
+        let mut buffered = Buffered::<_, Bytes>::new(Compat::new(writer));
+        buffered.set_write_strategy_queue_scalar();
+        buffered.headers_buf().extend(b"body");
+        let error = buffered.flush().await.expect_err("zero write is an error");
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn pipeline_flush_keeps_flatten_strategy_in_either_configuration_order() {
+        let io = Compat::new(Mock::new().build());
+        let mut buffered = Buffered::<_, Bytes>::new(io);
+        buffered.set_write_strategy_queue_scalar();
+        buffered.set_flush_pipeline(true);
+        assert!(matches!(
+            buffered.write_buf.strategy,
+            WriteStrategy::Flatten
+        ));
+
+        buffered.set_write_strategy_queue_scalar();
+        assert!(matches!(
+            buffered.write_buf.strategy,
+            WriteStrategy::Flatten
+        ));
     }
 
     // #[cfg(feature = "nightly")]
