@@ -21,6 +21,9 @@ serde_json = { version = "=1.0.151", features = ["raw_value"] }
 tokio = { version = "=1.53.2", features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 tower = { version = "=0.5.3", features = ["make", "util"] }
 
+[patch.crates-io]
+hyper = { path = "vendor/hyper" }
+
 [dev-dependencies]
 divan = "=0.1.21"
 gungraun = { version = "=0.20.0", features = ["act"] }
