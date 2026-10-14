@@ -57,7 +57,7 @@ pub(crate) struct Sender<T, U> {
     /// for more.
     giver: want::Giver,
     /// Actually bounded by the Giver, plus `buffered_once`.
-    inner: mpsc::UnboundedSender<Envelope<T, U>>,
+    inner: mpsc::UnboundedSender<Box<Envelope<T, U>>>,
 }
 
 /// An unbounded version.
@@ -68,7 +68,7 @@ pub(crate) struct Sender<T, U> {
 pub(crate) struct UnboundedSender<T, U> {
     /// Only used for `is_closed`, since `mpsc::UnboundedSender` cannot be checked.
     giver: want::SharedGiver,
-    inner: mpsc::UnboundedSender<Envelope<T, U>>,
+    inner: mpsc::UnboundedSender<Box<Envelope<T, U>>>,
 }
 
 impl<T, U> Sender<T, U> {
@@ -110,9 +110,9 @@ impl<T, U> Sender<T, U> {
         }
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::Retry(Some(tx))))))
+            .send(Box::new(Envelope(Some((val, Callback::Retry(Some(tx)))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|mut e| (*e.0).0.take().expect("envelope not dropped").0)
     }
 
     #[cfg(feature = "http1")]
@@ -122,9 +122,9 @@ impl<T, U> Sender<T, U> {
         }
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
+            .send(Box::new(Envelope(Some((val, Callback::NoRetry(Some(tx)))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|mut e| (*e.0).0.take().expect("envelope not dropped").0)
     }
 
     #[cfg(feature = "http2")]
@@ -149,17 +149,17 @@ impl<T, U> UnboundedSender<T, U> {
     pub(crate) fn try_send(&mut self, val: T) -> Result<RetryPromise<T, U>, T> {
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::Retry(Some(tx))))))
+            .send(Box::new(Envelope(Some((val, Callback::Retry(Some(tx)))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|mut e| (*e.0).0.take().expect("envelope not dropped").0)
     }
 
     pub(crate) fn send(&mut self, val: T) -> Result<Promise<U>, T> {
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
+            .send(Box::new(Envelope(Some((val, Callback::NoRetry(Some(tx)))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|mut e| (*e.0).0.take().expect("envelope not dropped").0)
     }
 }
 
@@ -174,7 +174,7 @@ impl<T, U> Clone for UnboundedSender<T, U> {
 }
 
 pub(crate) struct Receiver<T, U> {
-    inner: mpsc::UnboundedReceiver<Envelope<T, U>>,
+    inner: mpsc::UnboundedReceiver<Box<Envelope<T, U>>>,
     taker: want::Taker,
 }
 
@@ -451,6 +451,57 @@ mod tests {
             (true, Some(_)) => (),
             e => panic!("expected Error::Cancel(_), found {:?}", e),
         }
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn rejected_message_is_returned_to_sender() {
+        let (mut tx, _rx) = channel::<Custom, ()>();
+        tx.try_send(Custom(1)).unwrap();
+
+        let returned = tx
+            .try_send(Custom(2))
+            .expect_err("second message is not ready");
+        assert_eq!(returned.0, 2);
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn no_retry_send_drops_request_when_receiver_closes() {
+        let (mut tx, rx) = channel::<Custom, ()>();
+        let promise = tx.send(Custom(3)).unwrap();
+        drop(rx);
+
+        let returned = tx.send(Custom(4)).expect_err("closed send returns request");
+        assert_eq!(returned.0, 4);
+
+        let error = promise.await.unwrap().unwrap_err();
+        assert!(error.is_canceled());
+
+        let (mut tx, rx) = channel::<Custom, ()>();
+        drop(rx);
+        let returned = tx.send(Custom(6)).expect_err("closed send returns request");
+        assert_eq!(returned.0, 6);
+
+        #[cfg(feature = "http2")]
+        {
+            let (tx, rx) = channel::<Custom, ()>();
+            let mut tx = tx.unbound();
+            drop(rx);
+            let returned = tx.send(Custom(7)).expect_err("closed send returns request");
+            assert_eq!(returned.0, 7);
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn retry_send_returns_request_when_receiver_closes() {
+        let (mut tx, rx) = channel::<Custom, ()>();
+        let promise = tx.try_send(Custom(5)).unwrap();
+        drop(rx);
+
+        let error = promise.await.unwrap().unwrap_err();
+        assert_eq!(error.message.expect("retry returns request").0, 5);
     }
 
     #[cfg(not(miri))]

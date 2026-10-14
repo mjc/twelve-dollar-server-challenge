@@ -1,7 +1,10 @@
 # Local Hyper patch
 
 This directory contains the published Hyper 1.12.0 crate, licensed under MIT.
-The upstream license and notices are retained.
+The upstream license and notices are retained. The changes documented below
+are local benchmark patches layered on that crate; the client dispatch queue
+boxing is an additional local patch beyond the imported Axum compatibility
+changes.
 
 - Upstream source: https://github.com/hyperium/hyper/tree/v1.12.0
 - Upstream commit: `7f67699ce32d717081deb7018b4da7d679277ac0`
@@ -39,9 +42,18 @@ empty option rather than an allocated slot large enough for the handler future.
 This trades one reusable per-connection allocation for an allocation per active
 request.
 
+The client dispatch queues store `Box<Envelope<T, U>>` instead of keeping the
+request and callback inline in Tokio's unbounded-channel blocks. This makes each
+queue slot pointer-sized and reduces the fixed channel-block storage retained
+by idle connections. Sending a request now allocates its envelope separately;
+queue ordering, readiness, cancellation, and retry ownership continue to follow
+the existing dispatch behavior.
+
 The adaptive-read tests use the new initial size. Added tests check initial read
 and lazy write-header capacities, unchanged maximums, and rejection of a
 configured maximum below 8,192 bytes. Additional tests cover scalar-write
 ordering, partial and pending writes, zero-write errors, pipeline-flush
 selection, and handler-future allocation and cleanup on success, error, and
-cancellation.
+cancellation. Client-dispatch tests also check that rejected sends return the
+original request, receiver closure returns retryable requests, non-retryable
+sends report cancellation and return rejected requests to the sender.
