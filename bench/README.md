@@ -102,7 +102,7 @@ The reports include total and per-endpoint successful/failed requests per second
 connection attempts and establishments per second, and setup durations including
 failed and cancelled attempts. Request rates count requests; connection rates
 count new transport connections. A keep-alive request does not create another
-connection. Connection setup covers DNS, TCP, and HTTP proxy negotiation; an
+connection. Connection setup covers DNS and TCP; an
 attempt can try several resolved addresses.
 
 Linux telemetry records per-interface RX/TX throughput and packets per second,
@@ -129,6 +129,8 @@ owns an HTTP/1 client and retains its idle connection during think time. A serve
 that closes the connection requires that user to reconnect.
 Feed response bodies are consumed and dropped before the user sleeps. HTTP
 pools and sockets remain separate.
+Connections go directly to the supplied target. The generator ignores outbound
+proxy environment variables such as `HTTP_PROXY` and `ALL_PROXY`.
 
 `maximum_users` describes the load stage. Measured established sockets report
 the actual connection concurrency, which can differ during initial jitter,

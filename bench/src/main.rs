@@ -227,6 +227,7 @@ async fn configure_client(
         .unwrap_or(60.0);
     user.set_client_builder(
         reqwest::Client::builder()
+            .no_proxy()
             .http1_only()
             .pool_idle_timeout(None)
             .pool_max_idle_per_host(1)

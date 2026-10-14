@@ -242,6 +242,11 @@ class MetricsTests(unittest.TestCase):
         self.assertTrue(control.with_suffix(".done").exists())
 
     def test_report_counts_actual_connections_held_while_users_sleep(self):
+        # Generator routing is always direct, even with inherited proxy settings.
+        for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+                     "ALL_PROXY", "all_proxy"):
+            self.env[name] = "http://127.0.0.1:1"
+        self.env["NO_PROXY"] = self.env["no_proxy"] = ""
         output = self.root / "healthy"
         second_server = http.server.ThreadingHTTPServer(("127.0.0.1", self.listener_ports[1]), self.handler)
         second_thread = threading.Thread(target=second_server.serve_forever, daemon=True)
