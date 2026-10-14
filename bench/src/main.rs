@@ -4,6 +4,7 @@ use goose::{
     prelude::*,
     test_plan::TestPlanStepAction,
 };
+use gumdrop::Options;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -19,7 +20,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod config;
+mod connections;
+mod destinations;
 mod runner;
+mod telemetry;
+mod tls;
 
 const ENDPOINTS: [&str; 4] = [
     "GET /feed",
@@ -208,7 +214,11 @@ fn validate_source_ips(ips: &[IpAddr]) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-async fn configure_client(user: &mut GooseUser, source_ips: &[IpAddr]) -> TransactionResult {
+async fn configure_client(
+    user: &mut GooseUser,
+    source_ips: &[IpAddr],
+    connections: Arc<Mutex<connections::Connections>>,
+) -> TransactionResult {
     let timeout = user
         .config
         .timeout
@@ -217,14 +227,16 @@ async fn configure_client(user: &mut GooseUser, source_ips: &[IpAddr]) -> Transa
         .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
         .unwrap_or(60.0);
     user.set_client_builder(
-        reqwest::Client::builder()
+        tls::configure(reqwest::Client::builder(), user.config.accept_invalid_certs)
             .http1_only()
+            .pool_idle_timeout(None)
+            .pool_max_idle_per_host(1)
+            .connector_layer(connections::ConnectLayer(connections))
             .local_address(
                 (!source_ips.is_empty())
                     .then(|| source_ips[user.weighted_users_index % source_ips.len()]),
             )
             .gzip(!user.config.no_gzip)
-            .danger_accept_invalid_certs(user.config.accept_invalid_certs)
             .timeout(Duration::from_secs_f64(timeout)),
     )
     .await?;
@@ -277,9 +289,9 @@ async fn request(
         samples.failed += usize::from(!success);
         samples.checks_failed += usize::from(!check_success(endpoint, status) || bytes.is_none());
     }
-    if success {
+    if !user.config.no_metrics && success {
         user.set_success(&mut response.request)?;
-    } else {
+    } else if !user.config.no_metrics {
         // set_failure returns a transaction error. Keep browsing after failed
         // post/like/create requests, as the original k6 loop does.
         let _ = user.set_failure(
@@ -309,6 +321,8 @@ async fn browse(
         .ok()
         .filter(|feed| !feed.posts.is_empty() && feed.posts.iter().all(|post| post.id > 0))
         .map(|feed| feed.posts[rand::rng().random_range(0..feed.posts.len())].id);
+    // A sleeping VU only needs the ID, not its complete feed response.
+    drop(feed);
     let Some(post_id) = post_id else {
         // A malformed/empty feed cannot produce a post request. Surface this as
         // a check failure without changing k6's HTTP failure definition.
@@ -387,13 +401,68 @@ fn test_plan(vus: usize, ramp_up: &str, duration: &str) -> Result<String, GooseE
     Ok(plan)
 }
 
+fn prepare_descriptor_limit(users: usize) -> Result<(), Box<dyn std::error::Error>> {
+    // Change only this generator's soft limit, within the existing hard limit.
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limit is a valid writable rlimit and the selector is supported on Unix.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let required = (users as libc::rlim_t).saturating_add(256);
+    if limit.rlim_cur < required {
+        limit.rlim_cur = required.min(limit.rlim_max);
+        // SAFETY: the pointer is valid and the new soft limit is within the hard limit.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    if limit.rlim_cur < required {
+        eprintln!("Generator descriptor limit {} is below {} users plus process overhead; increase its hard limit", limit.rlim_cur, users);
+    }
+    Ok(())
+}
+
+fn native_metrics_requested(configuration: &goose::config::GooseConfiguration) -> bool {
+    !configuration.request_log.is_empty()
+        || !configuration.transaction_log.is_empty()
+        || !configuration.scenario_log.is_empty()
+        || !configuration.error_log.is_empty()
+        || !configuration.debug_log.is_empty()
+        || !configuration.report_file.is_empty()
+        || configuration.running_metrics.is_some()
+        || configuration
+            .co_mitigation
+            .as_ref()
+            .is_some_and(|mode| *mode != GooseCoordinatedOmissionMitigation::Disabled)
+}
+
 async fn run() -> Result<bool, Box<dyn std::error::Error>> {
     // Parse Goose's CLI first so --help works without seed data.
-    let attack = GooseAttack::initialize()?;
+    tls::initialize();
+    let configuration = goose::config::GooseConfiguration::parse_args_default_or_exit();
+    let native_metrics = native_metrics_requested(&configuration);
+    let host = if configuration.host.is_empty() {
+        setting("BASE_URL", "http://127.0.0.1:3000")
+    } else {
+        configuration.host.clone()
+    };
+    let port_setting = setting("DESTINATION_PORTS", "");
+    let destination_ports = if port_setting.is_empty() {
+        Vec::new()
+    } else {
+        config::parse_destination_ports(&port_setting)?
+    };
+    let targets = Arc::new(destinations::urls(&host, &destination_ports)?);
+    let assigned_hosts = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
+    let attack = GooseAttack::initialize_with_config(configuration)?;
     let vus: usize = setting("VUS", "100").parse()?;
     if vus == 0 {
         return Err("VUS must be positive".into());
     }
+    prepare_descriptor_limit(vus)?;
     let plan = test_plan(vus, &setting("RAMP_UP", "60s"), &setting("DURATION", "5m"))?;
     let stages = plan.parse::<goose::test_plan::TestPlan>()?;
     let planned_hold_s = if stages.steps.len() == 3 {
@@ -409,12 +478,30 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
     )))?);
     let user_offset: usize = setting("BENCH_USER_OFFSET", "0").parse()?;
     let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
+    let connection_metrics = Arc::new(Mutex::new(connections::Connections::default()));
     let runtime_errors = Arc::new(AtomicUsize::new(0));
     let startup_ips = source_ips.clone();
+    let startup_connections = connection_metrics.clone();
+    let startup_targets = targets.clone();
+    let startup_hosts = assigned_hosts.clone();
     let startup: TransactionFunction = Arc::new(move |user| {
         let ips = startup_ips.clone();
+        let connections = startup_connections.clone();
+        let targets = startup_targets.clone();
+        let assigned_hosts = startup_hosts.clone();
         Box::pin(async move {
-            configure_client(user, &ips).await?;
+            let index = destinations::index(
+                user_offset + user.weighted_users_index,
+                ips.len(),
+                targets.len(),
+            );
+            let target = &targets[index];
+            user.set_base_url(target.as_str())?;
+            assigned_hosts
+                .lock()
+                .unwrap()
+                .insert(target.as_str().to_owned());
+            configure_client(user, &ips, connections).await?;
             think(0.0, 5.0).await;
             Ok(())
         })
@@ -434,7 +521,25 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
             tokio::time::sleep(Duration::from_millis(remaining as u64)).await;
         }
     }
+    let counters = metrics.clone();
+    let connector_counts = connection_metrics.clone();
+    let roles = std::collections::BTreeMap::from([("generator".into(), vec![std::process::id()])]);
+    let telemetry_path = env::var("BENCH_TELEMETRY").unwrap_or_else(|_| "telemetry.jsonl".into());
+    let sample_interval: f64 = setting("BENCH_SAMPLE_INTERVAL", "1").parse()?;
+    if !sample_interval.is_finite() || sample_interval < 0.1 {
+        return Err("sample interval must be at least 0.1 seconds".into());
+    }
+    let sampler = telemetry::Sampler::start(
+        telemetry_path.into(),
+        roles,
+        Duration::from_secs_f64(sample_interval),
+        Arc::new(move || {
+            let counters = counters.lock().unwrap();
+            serde_json::json!({"requests": counters.iter().map(|s| [s.latency_ms.len(), s.failed]).collect::<Vec<_>>(), "connections": connector_counts.lock().unwrap().counts()})
+        }),
+    )?;
     let results = attack
+        .set_default(GooseDefault::NoMetrics, !native_metrics)?
         .set_default(
             GooseDefault::Host,
             setting("BASE_URL", "http://127.0.0.1:3000").as_str(),
@@ -460,6 +565,7 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         )
         .execute()
         .await?;
+    let telemetry_report = sampler.finish().map_err(|error| error.to_string());
     let mut metrics = metrics.lock().unwrap();
     let mut aggregate = Samples::default();
     let mut endpoints = std::collections::BTreeMap::new();
@@ -467,12 +573,22 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         aggregate.latency_ms.extend_from_slice(&samples.latency_ms);
         aggregate.failed += samples.failed;
         aggregate.checks_failed += samples.checks_failed;
-        endpoints.insert(*endpoint, samples.summary());
+        let mut endpoint_summary = serde_json::to_value(samples.summary())?;
+        if let serde_json::Value::Object(rates) =
+            connections::request_rates(samples, run_duration_s(&results))
+        {
+            endpoint_summary.as_object_mut().unwrap().extend(rates);
+        }
+        endpoints.insert(*endpoint, endpoint_summary);
     }
     let summary = aggregate.summary();
     let runtime_errors = runtime_errors.load(Ordering::Relaxed);
     let completed = run_completed(&results, goose::is_killswitch_triggered());
     let passed = completed && passes(&summary, runtime_errors);
+    let connection_report = connection_metrics
+        .lock()
+        .unwrap()
+        .report(run_duration_s(&results));
     let report = serde_json::json!({
         "generator": "goose 0.18.1",
         "maximum_users": results.maximum_users,
@@ -483,7 +599,11 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         "hold_started_at": results.history.iter().find(|step| matches!(step.action, TestPlanStepAction::Maintaining)).map(|step| step.timestamp),
         "hold_finished_at": results.history.iter().find(|step| matches!(step.action, TestPlanStepAction::Decreasing)).map(|step| step.timestamp),
         "planned_hold_s": planned_hold_s,
-        "hosts": results.hosts,
+        "hosts": &*assigned_hosts.lock().unwrap(),
+        "configured_hosts": targets.iter().map(reqwest::Url::as_str).collect::<Vec<_>>(),
+        "destination_ports": targets.iter().filter_map(reqwest::Url::port_or_known_default).collect::<Vec<_>>(),
+        "assignment": "fixed per user, balanced over source IP and destination port combinations; SSH workers use global user offsets",
+        "native_metrics": native_metrics,
         "source_ips": source_ips.as_ref(),
         "latency": "client wall time through complete response body, including connection setup",
         "percentiles": "k6 linear interpolation over unrounded milliseconds",
@@ -494,6 +614,9 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         "runtime_errors": runtime_errors,
         "passed": passed,
         "aggregate": summary,
+        "request_rates": connections::request_rates(&aggregate, run_duration_s(&results)),
+        "connections": connection_report,
+        "telemetry": match telemetry_report { Ok(value) => value, Err(error) => serde_json::json!({"unavailable_reason": error}) },
         "endpoints": endpoints,
     });
     let output = serde_json::to_string_pretty(&report)?;
@@ -509,6 +632,13 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         let mut file = BufWriter::new(fs::File::create(destination)?);
         serde_json::to_writer(&mut file, &*metrics)?;
         file.flush()?;
+        let destination = path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("connection-samples.json");
+        let mut file = BufWriter::new(fs::File::create(destination)?);
+        serde_json::to_writer(&mut file, &*connection_metrics.lock().unwrap())?;
+        file.flush()?;
     }
     println!(
         "{} — summary: {}",
@@ -518,11 +648,39 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
     Ok(passed)
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn observe_target(control: &Path) -> Result<u8, Box<dyn std::error::Error>> {
+    let parse_pids = |name| -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+        let value = setting(name, "");
+        if value.is_empty() {
+            return Ok(Vec::new());
+        }
+        value
+            .split(',')
+            .map(|p| p.parse::<u32>().map_err(Into::into))
+            .collect()
+    };
+    let interval: f64 = setting("BENCH_SAMPLE_INTERVAL", "1").parse()?;
+    if !interval.is_finite() || interval < 0.1 {
+        return Err("invalid sample interval".into());
+    }
+    telemetry::observe(
+        control,
+        parse_pids("BENCH_APPLICATION_PIDS")?,
+        parse_pids("BENCH_PROXY_PIDS")?,
+        config::parse_destination_ports(&setting(
+            "BENCH_TARGET_PORTS",
+            &setting("BENCH_TARGET_PORT", "3000"),
+        ))?,
+        Duration::from_secs_f64(interval),
+    )
+}
+
+fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().is_some_and(|arg| {
         [
+            "--refresh-observer",
+            "--observe",
             "--supervise",
             "--stop-supervised",
             "--ready-supervised",
@@ -531,7 +689,11 @@ async fn main() -> ExitCode {
         .contains(&arg.as_str())
     }) {
         let result = if let Some(path) = args.get(1) {
-            if args[0] == "--supervise" {
+            if args[0] == "--refresh-observer" {
+                runner::refresh_observer(Path::new(path))
+            } else if args[0] == "--observe" {
+                observe_target(Path::new(path))
+            } else if args[0] == "--supervise" {
                 runner::supervise(Path::new(path), &args[2..])
             } else if args[0] == "--stop-supervised" {
                 runner::stop_supervised(Path::new(path))
@@ -553,48 +715,77 @@ async fn main() -> ExitCode {
             }
         };
     }
-    if args.first().is_some_and(|arg| arg == "--orchestrate") {
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = cancelled.clone();
-        let signals = (
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()),
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()),
-        );
-        let (mut interrupt, mut terminate) = match signals {
-            (Ok(interrupt), Ok(terminate)) => (interrupt, terminate),
-            (Err(error), _) | (_, Err(error)) => {
-                eprintln!("benchmark signal handler error: {error}");
-                return ExitCode::from(2);
-            }
-        };
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = interrupt.recv() => {},
-                _ = terminate.recv() => {},
-            }
-            flag.store(true, Ordering::Relaxed);
-        });
-        return match runner::run(&args[1..], cancelled) {
-            Ok(code) => ExitCode::from(code),
+    // Control/observer commands above need no async runtime or worker threads.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("benchmark runtime error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    runtime.block_on(async {
+        if args.first().is_some_and(|arg| arg == "--orchestrate") {
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = cancelled.clone();
+            let signals = (
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()),
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()),
+            );
+            let (mut interrupt, mut terminate) = match signals {
+                (Ok(interrupt), Ok(terminate)) => (interrupt, terminate),
+                (Err(error), _) | (_, Err(error)) => {
+                    eprintln!("benchmark signal handler error: {error}");
+                    return ExitCode::from(2);
+                }
+            };
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = interrupt.recv() => {},
+                    _ = terminate.recv() => {},
+                }
+                flag.store(true, Ordering::Relaxed);
+            });
+            return match runner::run(&args[1..], cancelled) {
+                Ok(code) => ExitCode::from(code),
+                Err(error) => {
+                    eprintln!("benchmark runner error: {error}");
+                    ExitCode::from(2)
+                }
+            };
+        }
+        match run().await {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::from(1),
             Err(error) => {
-                eprintln!("benchmark runner error: {error}");
+                eprintln!("load test error: {error}");
                 ExitCode::from(2)
             }
-        };
-    }
-    match run().await {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::from(1),
-        Err(error) => {
-            eprintln!("load test error: {error}");
-            ExitCode::from(2)
         }
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_metrics_are_enabled_only_for_requested_diagnostics() {
+        let mut config = goose::config::GooseConfiguration::default();
+        assert!(!native_metrics_requested(&config));
+        config.request_log = "native.log".into();
+        assert!(native_metrics_requested(&config));
+        config.request_log.clear();
+        config.report_file.push("native.html".into());
+        assert!(native_metrics_requested(&config));
+        config.report_file.clear();
+        config.co_mitigation = Some(GooseCoordinatedOmissionMitigation::Disabled);
+        assert!(!native_metrics_requested(&config));
+        config.co_mitigation = Some(GooseCoordinatedOmissionMitigation::Average);
+        assert!(native_metrics_requested(&config));
+    }
 
     #[test]
     fn empty_environment_settings_use_k6_defaults() {
@@ -781,9 +972,13 @@ mod tests {
         for index in 0..=10 {
             let mut user = GooseUser::single(host.parse().unwrap(), &config).unwrap();
             user.weighted_users_index = index;
-            configure_client(&mut user, if index < 10 { &ips } else { &[] })
-                .await
-                .unwrap();
+            configure_client(
+                &mut user,
+                if index < 10 { &ips } else { &[] },
+                Arc::new(Mutex::new(connections::Connections::default())),
+            )
+            .await
+            .unwrap();
             for _ in 0..3 {
                 let response = user
                     .client

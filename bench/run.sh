@@ -1,16 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export BENCH_CALLER_DIR="$PWD"
 bench_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd -- "$bench_dir"
 
-usage() { echo "Usage: $0 [IP PORT] [--user USER] [--output-dir DIR] [Goose options]" >&2; exit 2; }
+usage() { echo "Usage: $0 [IP PORTS] [options] [-- Goose diagnostics]; use --help for options" >&2; exit 2; }
+
+validate_ports() {
+  local value=$1 item start end
+  local -a items
+  if [[ $value == \[* || $value == *\] ]]; then
+    [[ $value == \[*\] ]] || return 1
+    value=${value:1:${#value}-2}
+  fi
+  [[ -n $value ]] || return 1
+  [[ $value != ,* && $value != *, && $value != *,,* ]] || return 1
+  IFS=, read -r -a items <<< "$value"
+  for item in "${items[@]}"; do
+    if [[ $item =~ ^[[:space:]]*([0-9]+)[[:space:]]*-[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+      start=${BASH_REMATCH[1]}
+      end=${BASH_REMATCH[2]}
+    elif [[ $item =~ ^[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+      start=${BASH_REMATCH[1]}
+      end=$start
+    else
+      return 1
+    fi
+    [[ ${#start} -le 5 && ${#end} -le 5 ]] || return 1
+    (( 10#$start >= 1 && 10#$start <= 65535 && 10#$end >= 1 && 10#$end <= 65535 && 10#$start <= 10#$end )) || return 1
+  done
+}
 
 # Keep BASE_URL and Goose flags available, or accept an explicit target IP/port.
 if [[ $# -gt 0 && $1 != -* ]]; then
-  if [[ $# -lt 2 || ! $2 =~ ^[0-9]{1,5}$ ]] || (( 10#$2 < 1 || 10#$2 > 65535 )); then
+  if [[ $# -lt 2 ]] || ! validate_ports "$2"; then
     usage
   fi
+  target_ports=$2
+  first_port=${target_ports#[}
+  first_port=${first_port%]}
+  first_port=${first_port%%,*}
+  first_port=${first_port%%-*}
+  first_port=${first_port//[[:space:]]/}
   target_ip=$1
   if [[ $target_ip == \[*\] ]]; then
     target_ip=${target_ip:1:${#target_ip}-2}
@@ -26,7 +58,8 @@ if [[ $# -gt 0 && $1 != -* ]]; then
       (( 10#$octet <= 255 )) || usage
     done
   fi
-  export BASE_URL="http://$target_ip:$2"
+  export BASE_URL="http://$target_ip:$first_port"
+  export DESTINATION_PORTS="$target_ports"
   shift 2
 fi
 

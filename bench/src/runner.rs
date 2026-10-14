@@ -1,9 +1,11 @@
-use super::{load_tokens, parse_source_ips, passes, setting, Samples, ENDPOINTS};
+use super::{
+    config, connections, destinations, load_tokens, parse_source_ips, passes, Samples, ENDPOINTS,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
     error::Error,
     fs::{self, File},
@@ -46,6 +48,10 @@ struct Report {
     runtime_errors: usize,
     completed: bool,
     aggregate: Value,
+    #[serde(default)]
+    connections: Value,
+    #[serde(default)]
+    telemetry: Value,
 }
 
 // Quote every argument for the remote POSIX shell, including user-supplied flags.
@@ -159,7 +165,7 @@ fn wait_child(
     }
 }
 
-pub(super) fn supervise(control: &Path, args: &[String]) -> Result<u8> {
+pub(super) fn wait_start(control: &Path) -> Result<i64> {
     fs::write(control.with_extension("ready"), "ready\n")?;
     let deadline = Instant::now() + Duration::from_secs(120);
     while !control.with_extension("start").exists() {
@@ -178,6 +184,11 @@ pub(super) fn supervise(control: &Path, args: &[String]) -> Result<u8> {
             "missed coordinated start; check SSH delay and host clock synchronization".into(),
         );
     }
+    Ok(start_at)
+}
+
+pub(super) fn supervise(control: &Path, args: &[String]) -> Result<u8> {
+    let start_at = wait_start(control)?;
     let mut child = Command::new(env::current_exe()?)
         .args(args)
         .env("BENCH_START_AT", start_at.to_string())
@@ -217,7 +228,13 @@ pub(super) fn start_supervised(control: &Path, timestamp: &str) -> Result<u8> {
     let _: i64 = timestamp.parse()?;
     let temporary = control.with_extension("start.tmp");
     fs::write(&temporary, timestamp)?;
+    refresh_observer(control)?;
     fs::rename(temporary, control.with_extension("start"))?;
+    Ok(0)
+}
+
+pub(super) fn refresh_observer(control: &Path) -> Result<u8> {
+    fs::write(control.with_extension("lease"), "alive\n")?;
     Ok(0)
 }
 
@@ -231,6 +248,298 @@ pub(super) fn stop_supervised(control: &Path) -> Result<u8> {
         thread::sleep(Duration::from_millis(100));
     }
     Ok(0)
+}
+
+// A target observer uses the same start barrier as the generators, then stops
+// after their final responses. Network counters retain their own measured window.
+struct TargetMonitor {
+    child: Option<Child>,
+    binary: PathBuf,
+    dir: PathBuf,
+    control: PathBuf,
+    remote: Option<(String, String, String)>,
+    heartbeat_cancelled: Arc<AtomicBool>,
+    heartbeat_stop: Option<mpsc::Sender<()>>,
+    heartbeat: Option<thread::JoinHandle<()>>,
+}
+impl TargetMonitor {
+    fn prepare(
+        cfg: &config::Config,
+        binary: &Path,
+        output: &Path,
+        cancelled: &AtomicBool,
+    ) -> Result<Self> {
+        let url = reqwest::Url::parse(&cfg.base_url)?;
+        let host = url
+            .host_str()
+            .ok_or("target URL has no host")?
+            .trim_matches(['[', ']']);
+
+        if cfg.user.is_none() && !host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+            return Err("target process monitoring needs --user for a remote target".into());
+        }
+        let dir = output.join("target");
+        fs::create_dir(&dir)?;
+        let remote = cfg.user.as_ref().map(|user| {
+            (
+                user.clone(),
+                host.to_owned(),
+                format!(
+                    "/tmp/feed-load-target-{}-{}",
+                    Utc::now().timestamp_millis(),
+                    std::process::id()
+                ),
+            )
+        });
+        let control = dir.join("metrics");
+        let assignments = [
+            format!(
+                "BENCH_APPLICATION_PIDS={}",
+                cfg.application_pids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            format!(
+                "BENCH_PROXY_PIDS={}",
+                cfg.proxy_pids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            format!(
+                "BENCH_TARGET_PORTS={}",
+                cfg.destination_ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            format!(
+                "BENCH_SAMPLE_INTERVAL={}",
+                cfg.sample_interval.as_secs_f64()
+            ),
+        ];
+        let log = File::create(dir.join("output.log"))?;
+        let mut command = if let Some((user, host, remote_dir)) = &remote {
+            checked(
+                ssh(user, host).arg(format!("umask 077; mkdir -- {}", quote(remote_dir))),
+                cancelled,
+            )?;
+            checked(
+                scp().arg("--").arg(binary).arg(destination(
+                    user,
+                    host,
+                    &format!("{remote_dir}/feed-load"),
+                )),
+                cancelled,
+            )?;
+            checked(
+                ssh(user, host).arg(format!(
+                    "{} --version",
+                    quote(&format!("{remote_dir}/feed-load"))
+                )),
+                cancelled,
+            )?;
+            let mut command = ssh(user, host);
+            command.arg(format!(
+                "cd {} || exit 2; trap '' HUP; exec env {} ./feed-load --observe metrics",
+                quote(remote_dir),
+                assignments
+                    .iter()
+                    .map(|v| quote(v))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+            command
+        } else {
+            let mut command = Command::new(binary);
+            command.current_dir(&dir).arg("--observe").arg(&control);
+            for assignment in &assignments {
+                let (key, value) = assignment.split_once('=').unwrap();
+                command.env(key, value);
+            }
+            command
+        };
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log))
+            .process_group(0)
+            .spawn()?;
+        Ok(Self {
+            child: Some(child),
+            binary: binary.into(),
+            dir,
+            control,
+            remote,
+            heartbeat_cancelled: Arc::new(AtomicBool::new(false)),
+            heartbeat_stop: None,
+            heartbeat: None,
+        })
+    }
+    fn control_command(&self, action: &str, timestamp: Option<&str>) -> Command {
+        if let Some((user, host, remote_dir)) = &self.remote {
+            let mut cmd = ssh(user, host);
+            cmd.arg(format!(
+                "{} {} {} {}",
+                quote(&format!("{remote_dir}/feed-load")),
+                action,
+                quote(&format!("{remote_dir}/metrics")),
+                timestamp.map(quote).unwrap_or_default()
+            ));
+            cmd
+        } else {
+            let mut cmd = Command::new(&self.binary);
+            cmd.arg(action).arg(&self.control);
+            if let Some(timestamp) = timestamp {
+                cmd.arg(timestamp);
+            }
+            cmd
+        }
+    }
+    fn ready(&mut self, cancelled: &AtomicBool) -> Result<()> {
+        if self.child.as_mut().unwrap().try_wait()?.is_some() {
+            return Err("target observer exited before readiness; see target/output.log".into());
+        }
+        checked(
+            &mut self.control_command("--ready-supervised", None),
+            cancelled,
+        )
+    }
+    fn start(&mut self, timestamp: &str, cancelled: &AtomicBool) -> Result<()> {
+        checked(
+            &mut self.control_command("--start-supervised", Some(timestamp)),
+            cancelled,
+        )?;
+        let remote = self.remote.clone();
+        let binary = self.binary.clone();
+        let control = self.control.clone();
+        let flag = self.heartbeat_cancelled.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.heartbeat_stop = Some(sender);
+        self.heartbeat = Some(thread::spawn(move || {
+            while matches!(
+                receiver.recv_timeout(Duration::from_secs(10)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                let mut command = if let Some((user, host, dir)) = &remote {
+                    let mut command = ssh(user, host);
+                    command.arg(format!(
+                        "{} --refresh-observer {}",
+                        quote(&format!("{dir}/feed-load")),
+                        quote(&format!("{dir}/metrics"))
+                    ));
+                    command
+                } else {
+                    let mut command = Command::new(&binary);
+                    command.arg("--refresh-observer").arg(&control);
+                    command
+                };
+                if let Err(error) = checked(&mut command, &flag) {
+                    if !flag.load(Ordering::Relaxed) {
+                        eprintln!("Target telemetry lease refresh failed: {error}");
+                    }
+                }
+            }
+        }));
+        Ok(())
+    }
+    fn finish(&mut self) -> Result<Value> {
+        self.heartbeat_cancelled.store(true, Ordering::Relaxed);
+        if let Some(sender) = self.heartbeat_stop.take() {
+            let _ = sender.send(());
+        }
+        if let Some(handle) = self.heartbeat.take() {
+            let _ = handle.join();
+        }
+        let stop = checked(
+            &mut self.control_command("--stop-supervised", None),
+            &AtomicBool::new(false),
+        );
+        if let Some(mut child) = self.child.take() {
+            let status = wait_child(
+                &mut child,
+                &AtomicBool::new(false),
+                Some(Duration::from_secs(20)),
+            )?;
+            if !status.success() {
+                return Err(format!("target observer exited: {status}").into());
+            }
+        }
+        stop?;
+        if let Some((user, host, remote_dir)) = &self.remote {
+            for name in ["telemetry.jsonl", "telemetry-summary.json"] {
+                checked(
+                    scp()
+                        .arg("--")
+                        .arg(destination(user, host, &format!("{remote_dir}/{name}")))
+                        .arg(self.dir.join(name)),
+                    &AtomicBool::new(false),
+                )?;
+            }
+        }
+        Ok(serde_json::from_reader(BufReader::new(File::open(
+            self.dir.join("telemetry-summary.json"),
+        )?))?)
+    }
+}
+impl Drop for TargetMonitor {
+    fn drop(&mut self) {
+        if self.child.is_some() {
+            let _ = self.finish();
+        }
+    }
+}
+
+fn prepare_monitor(
+    cfg: &config::Config,
+    binary: &Path,
+    output: &Path,
+    cancelled: &AtomicBool,
+) -> (Option<TargetMonitor>, Option<String>) {
+    let result = TargetMonitor::prepare(cfg, binary, output, cancelled).and_then(|mut monitor| {
+        monitor.ready(cancelled)?;
+        Ok(monitor)
+    });
+    match result {
+        Ok(monitor) => (Some(monitor), None),
+        Err(error) => {
+            eprintln!("Target telemetry unavailable: {error}");
+            (None, Some(error.to_string()))
+        }
+    }
+}
+
+fn network_hosts(generators: &Value, target: &Value) -> Value {
+    let mut hosts = BTreeMap::<String, Value>::new();
+    let reports = generators
+        .as_object()
+        .into_iter()
+        .flat_map(|map| map.iter())
+        .map(|(name, value)| (name.as_str(), value))
+        .chain(std::iter::once(("target", target)));
+    for (name, report) in reports {
+        if report["host_boot_id"].is_null() || report["network_namespace"].is_null() {
+            continue;
+        }
+        let key = format!("{}:{}", report["host_boot_id"], report["network_namespace"]);
+        let entry = hosts.entry(key).or_insert_with(|| json!({"observed_by": [], "network": report["network"], "duration_s": report["observed_duration_s"], "limits": report["limits"]}));
+        entry["observed_by"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(name));
+        if report["observed_duration_s"].as_f64().unwrap_or(0.0)
+            > entry["duration_s"].as_f64().unwrap_or(0.0)
+        {
+            entry["network"] = report["network"].clone();
+            entry["duration_s"] = report["observed_duration_s"].clone();
+            entry["limits"] = report["limits"].clone();
+        }
+    }
+    json!({"scope": "host network-namespace interface counters, including background traffic; aliases on one host are deduplicated; interfaces and RX/TX are not summed because virtual links and loopback can count traffic twice", "hosts": hosts})
 }
 
 fn split_users(total: usize, count: usize) -> Result<Vec<(usize, usize)>> {
@@ -258,6 +567,9 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
     let mut hosts = BTreeSet::new();
     let mut source_ips = BTreeSet::new();
     let mut completed = true;
+    let mut connection_data = connections::Connections::default();
+    let mut telemetry = BTreeMap::new();
+    let mut connection_available = true;
     let mut hold_start = None;
     let mut hold_end = None;
     let mut required_hold = 0.0_f64;
@@ -288,6 +600,30 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
         })();
         match parsed {
             Ok((report, raw)) => {
+                let connection_samples = output.join(&worker.name).join("connection-samples.json");
+                match File::open(connection_samples)
+                    .map_err(|error| error.to_string())
+                    .and_then(|file| {
+                        serde_json::from_reader::<_, connections::Connections>(BufReader::new(file))
+                            .map_err(|error| error.to_string())
+                    }) {
+                    Ok(samples)
+                        if samples.cancelled <= samples.failed_ms.len()
+                            && samples
+                                .successful_ms
+                                .iter()
+                                .chain(&samples.failed_ms)
+                                .all(|ms| ms.is_finite() && *ms >= 0.0)
+                            && report.connections["established"].as_u64()
+                                == Some(samples.successful_ms.len() as u64)
+                            && report.connections["failed"].as_u64()
+                                == Some(samples.failed_ms.len() as u64) =>
+                    {
+                        connection_data.merge(samples)
+                    }
+                    _ => connection_available = false,
+                }
+                telemetry.insert(worker.name.clone(), report.telemetry);
                 completed &= report.completed && matches!(worker.exit_code, Some(0 | 1));
                 maximum_users += report.maximum_users;
                 total_users += report.total_users;
@@ -330,13 +666,25 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
     }
     let mut aggregate = Samples::default();
     let mut endpoints = std::collections::BTreeMap::new();
-    for (endpoint, sample) in ENDPOINTS.iter().zip(samples.iter_mut()) {
+    for (endpoint_name, sample) in ENDPOINTS.iter().zip(samples.iter_mut()) {
         aggregate.latency_ms.extend_from_slice(&sample.latency_ms);
         aggregate.failed += sample.failed;
         aggregate.checks_failed += sample.checks_failed;
-        endpoints.insert(*endpoint, sample.summary());
+        let mut endpoint = serde_json::to_value(sample.summary()).unwrap();
+        let duration_s = started
+            .zip(finished)
+            .and_then(|(s, f)| (f - s).to_std().ok())
+            .map(|d| d.as_secs_f64());
+        if let Value::Object(rates) = connections::request_rates(sample, duration_s) {
+            endpoint.as_object_mut().unwrap().extend(rates);
+        }
+        endpoints.insert(*endpoint_name, endpoint);
     }
     let summary = aggregate.summary();
+    let duration_s = started
+        .zip(finished)
+        .and_then(|(s, f)| (f - s).to_std().ok())
+        .map(|d| d.as_secs_f64());
     json!({
         "generator": "goose 0.18.1", "workers": workers,
         "completed": completed, "passed": completed && passes(&summary, runtime_errors),
@@ -350,30 +698,118 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
         "percentiles": "k6 linear interpolation over all workers' unrounded samples",
         "thresholds": { "p95_ms_lt": 500, "p99_ms_lt": 1000, "failure_rate_lt": 0.01 },
         "aggregate": summary, "endpoints": endpoints,
+        "request_rates": connections::request_rates(&aggregate, duration_s),
+        "connections": if connection_available { connection_data.report(duration_s) } else { json!({"unavailable_reason": "missing or inconsistent per-worker connection samples"}) },
+        "generator_telemetry": telemetry,
     })
 }
 
-pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
-    let mut username = None;
-    let mut output_dir = None;
-    let mut options = Vec::new();
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--user" => username = Some(args.next().ok_or("--user requires a username")?.clone()),
-            "--output-dir" => {
-                output_dir = Some(PathBuf::from(
-                    args.next().ok_or("--output-dir requires a path")?,
-                ))
-            }
-            _ => options.push(arg.clone()),
+fn render_report(report: &Value) -> String {
+    let fmt = |value: &Value| {
+        value
+            .as_f64()
+            .map(|n| format!("{n:.2}"))
+            .unwrap_or_else(|| "unavailable".into())
+    };
+    let mut text = format!("# Benchmark results\n\n{}; {} requests over {} seconds.\n\n| Endpoint | Requests/s | Successful/s | Failed/s | p95 ms | p99 ms |\n|---|---:|---:|---:|---:|---:|\n", if report["passed"] == true {"PASS"} else {"FAIL"}, report["aggregate"]["requests"], fmt(&report["duration_s"]));
+    if let Some(endpoints) = report["endpoints"].as_object() {
+        for (name, endpoint) in endpoints {
+            text.push_str(&format!(
+                "| {name} | {} | {} | {} | {} | {} |\n",
+                fmt(&endpoint["requests_per_second"]),
+                fmt(&endpoint["successful_requests_per_second"]),
+                fmt(&endpoint["failed_requests_per_second"]),
+                fmt(&endpoint["p95_ms"]),
+                fmt(&endpoint["p99_ms"])
+            ));
         }
     }
+    let connections = &report["connections"];
+    text.push_str(&format!("\nConnections: {} established/s, {} failed attempts/s; setup p95 {} ms, p99 {} ms (successes and failures).\n", fmt(&connections["connections_per_second"]), fmt(&connections["failed_per_second"]), fmt(&connections["setup_duration_ms"]["p95_ms"]), fmt(&connections["setup_duration_ms"]["p99_ms"])));
+    if let Some(reason) = connections["unavailable_reason"].as_str() {
+        text.push_str(&format!("Connection metrics unavailable: {reason}\n"));
+    }
+    text.push_str("\nHost interface counters include background traffic. Packet counters may reflect offloads. Do not sum virtual links or both connection ends. Host aliases are deduplicated.\n\n| Observer(s) | Interface | RX Mbit/s | TX Mbit/s | RX packets/s | TX packets/s |\n|---|---|---:|---:|---:|---:|\n");
+    if let Some(hosts) = report["network_hosts"]["hosts"].as_object() {
+        for host in hosts.values() {
+            let observers = host["observed_by"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Some(interfaces) = host["network"].as_object() {
+                for (name, network) in interfaces {
+                    let mbps = |key| {
+                        network[key]
+                            .as_f64()
+                            .map(|n| json!(n / 1_000_000.0))
+                            .unwrap_or(Value::Null)
+                    };
+                    text.push_str(&format!(
+                        "| {observers} | {name} | {} | {} | {} | {} |\n",
+                        fmt(&mbps("receive_bits_per_second")),
+                        fmt(&mbps("transmit_bits_per_second")),
+                        fmt(&network["receive_packets_per_second"]),
+                        fmt(&network["transmit_packets_per_second"])
+                    ));
+                }
+            }
+        }
+    }
+    text.push_str("\nCPU includes all process threads; 100% is one core. Memory, descriptors and established sockets are sampled peaks.\n\n| Observer | Role / PID | CPU % | Peak RSS MiB | Peak FDs | FD soft / hard limit | Peak established sockets |\n|---|---|---:|---:|---:|---|---:|\n");
+    let observations = report["generator_telemetry"]
+        .as_object()
+        .into_iter()
+        .flat_map(|m| m.iter())
+        .map(|(name, value)| (name.as_str(), value))
+        .chain(std::iter::once(("target", &report["target_telemetry"])));
+    for (observer, value) in observations {
+        if let Some(reason) = value["unavailable_reason"].as_str() {
+            text.push_str(&format!("| {observer} | {reason} | unavailable | unavailable | unavailable | unavailable | unavailable |\n"));
+        }
+        if let Some(roles) = value["processes"].as_object() {
+            for (role, values) in roles {
+                if let Some(reason) = values["unavailable_reason"].as_str() {
+                    text.push_str(&format!("| {observer} | {role}: {reason} | unavailable | unavailable | unavailable | unavailable | unavailable |\n"));
+                }
+                for process in values["processes"].as_array().into_iter().flatten() {
+                    let rss = process["peak_resident_bytes"]
+                        .as_f64()
+                        .map(|n| json!(n / 1048576.0))
+                        .unwrap_or(Value::Null);
+                    text.push_str(&format!(
+                        "| {observer} | {role} / {} | {} | {} | {} | {} / {} | {} |\n",
+                        process["pid"],
+                        fmt(&process["cpu_percent_of_one_core"]),
+                        fmt(&rss),
+                        process["peak_open_descriptors"],
+                        process["descriptor_limits"]["soft"],
+                        process["descriptor_limits"]["hard"],
+                        process["peak_established_sockets"]
+                    ));
+                }
+            }
+        }
+    }
+    text.push_str("\nExact latency/connection samples, resource time series, kernel limits and availability details are retained alongside aggregate.json.\n");
+    text
+}
+
+pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
+    let cfg = config::parse(args)?;
+    if cfg.help {
+        print!("{}", config::HELP);
+        return Ok(0);
+    }
+    let username = cfg.user.clone();
+    let options = cfg.diagnostics.clone();
     let binary = env::current_exe()?;
     if options.iter().any(|arg| {
         matches!(
             arg.as_str(),
-            "--help" | "-h" | "--version" | "-V" | "--list" | "-l" | "--scenarios-list"
+            "--version" | "-V" | "--list" | "-l" | "--scenarios-list"
         )
     }) {
         return Ok(Command::new(binary)
@@ -382,14 +818,18 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
             .code()
             .unwrap_or(2) as u8);
     }
-    let ips = parse_source_ips(&setting("SOURCE_IPS", ""))?;
-    let users: usize = setting("VUS", "100").parse()?;
-    if users == 0 {
-        return Err("VUS must be positive".into());
-    }
-    let tokens = fs::canonicalize(setting("TOKENS", "../seed/tokens.json"))?;
+    let ips = parse_source_ips(&cfg.source_ips)?;
+    let users = cfg.users;
+    let targets = destinations::urls(&cfg.base_url, &cfg.destination_ports)?;
+    let destination_ports = cfg
+        .destination_ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let tokens = fs::canonicalize(&cfg.tokens)?;
     load_tokens(&tokens)?;
-    let output = output_dir.unwrap_or_else(|| {
+    let output = cfg.output.clone().unwrap_or_else(|| {
         PathBuf::from(format!(
             "../results/run-{}-{}",
             Utc::now().timestamp_millis(),
@@ -410,6 +850,8 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
         output.join("aggregate.json"),
         "{\"completed\":false,\"passed\":false,\"status\":\"running\"}\n",
     )?;
+    let mut target_unavailable = None;
+    let mut monitor = None;
     let mut workers = Vec::new();
     if let Some(user) = &username {
         if user.is_empty()
@@ -422,25 +864,6 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
         }
         if ips.iter().collect::<BTreeSet<_>>().len() != ips.len() {
             return Err("SSH generator addresses must be unique".into());
-        }
-        // A custom Goose test plan/users setting would bypass the VUS split.
-        if options.iter().any(|arg| {
-            let flag = arg.split('=').next().unwrap();
-            [
-                "--test-plan",
-                "--users",
-                "--iterations",
-                "--run-time",
-                "--startup-time",
-                "--hatch-rate",
-                "--no-autostart",
-            ]
-            .contains(&flag)
-                || ["-u", "-r", "-s", "-t"]
-                    .iter()
-                    .any(|prefix| arg.starts_with(prefix))
-        }) {
-            return Err("in SSH mode use VUS, RAMP_UP and DURATION; per-host user/test-plan overrides are unsupported".into());
         }
         for (index, (ip, (count, offset))) in
             ips.iter().zip(split_users(users, ips.len())?).enumerate()
@@ -518,9 +941,11 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
                 let user = user.clone();
                 let options = options.clone();
                 let cancelled = cancelled.clone();
-                let base_url = setting("BASE_URL", "http://127.0.0.1:3000");
-                let ramp = setting("RAMP_UP", "60s");
-                let duration = setting("DURATION", "5m");
+                let base_url = cfg.base_url.clone();
+                let destination_ports = destination_ports.clone();
+                let ramp = cfg.ramp_up.clone();
+                let duration = cfg.duration.clone();
+                let sample_interval = cfg.sample_interval.as_secs_f64();
                 joins.push(thread::spawn(move || {
                     let mut worker = worker;
                     let dir = output.join(&worker.name);
@@ -528,6 +953,7 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
                     let result = (|| -> Result<()> {
                         let assignments = [
                             format!("BASE_URL={base_url}"),
+                            format!("DESTINATION_PORTS={destination_ports}"),
                             format!("VUS={}", worker.users),
                             format!("RAMP_UP={ramp}"),
                             format!("DURATION={duration}"),
@@ -535,6 +961,8 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
                             "TOKENS=../tokens.json".into(),
                             "SUMMARY=summary.json".into(),
                             "BENCH_SAMPLES=samples.json".into(),
+                            "BENCH_TELEMETRY=telemetry.jsonl".into(),
+                            format!("BENCH_SAMPLE_INTERVAL={sample_interval}"),
                             "SOURCE_IPS=".into(),
                         ];
                         let command = format!(
@@ -596,8 +1024,12 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
                         &cancelled,
                     )?;
                 }
+                (monitor, target_unavailable) = prepare_monitor(&cfg, &binary, &output, &cancelled);
                 // All SSH sessions are ready before any generator starts.
                 let start_at = (Utc::now().timestamp_millis() + 5000).to_string();
+                if let Some(observer) = monitor.as_mut() {
+                    observer.start(&start_at, &cancelled)?;
+                }
                 let publications = thread::scope(|scope| {
                     let mut handles = Vec::new();
                     for (ip, dir) in &controls {
@@ -643,15 +1075,31 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
         let dir = output.join("local");
         fs::create_dir(&dir)?;
         let log = File::create(dir.join("output.log"))?;
+        (monitor, target_unavailable) = prepare_monitor(&cfg, &binary, &output, &cancelled);
+        let start_at = (Utc::now().timestamp_millis() + 1000).to_string();
+        if let Some(observer) = monitor.as_mut() {
+            observer.start(&start_at, &cancelled)?;
+        }
         let status = execute(
             Command::new(&binary)
                 .args(options)
                 .current_dir(&dir)
                 .env("TOKENS", tokens)
+                .env("BASE_URL", &cfg.base_url)
+                .env("DESTINATION_PORTS", &destination_ports)
+                .env("VUS", users.to_string())
+                .env("RAMP_UP", &cfg.ramp_up)
+                .env("DURATION", &cfg.duration)
+                .env("SOURCE_IPS", &cfg.source_ips)
+                .env(
+                    "BENCH_SAMPLE_INTERVAL",
+                    cfg.sample_interval.as_secs_f64().to_string(),
+                )
                 .env("SUMMARY", dir.join("summary.json"))
                 .env("BENCH_SAMPLES", dir.join("samples.json"))
+                .env("BENCH_TELEMETRY", dir.join("telemetry.jsonl"))
                 .env("BENCH_USER_OFFSET", "0")
-                .env_remove("BENCH_START_AT")
+                .env("BENCH_START_AT", start_at)
                 .stdout(Stdio::from(log.try_clone()?))
                 .stderr(Stdio::from(log)),
             &cancelled,
@@ -676,7 +1124,22 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
             error,
         });
     }
+    let target_telemetry = match monitor.as_mut() {
+        Some(monitor) => monitor.finish().unwrap_or_else(|error| {
+            eprintln!("Target telemetry unavailable: {error}");
+            json!({"unavailable_reason": error.to_string(), "shutdown_unconfirmed": true})
+        }),
+        None => {
+            json!({"unavailable_reason": target_unavailable.unwrap_or_else(|| "target observer unavailable".into())})
+        }
+    };
     let mut aggregate = collect(&output, &mut workers);
+    aggregate["network_hosts"] =
+        network_hosts(&aggregate["generator_telemetry"], &target_telemetry);
+    aggregate["target_telemetry"] = target_telemetry;
+    aggregate["destination_ports"] = json!(cfg.destination_ports);
+    aggregate["configured_hosts"] =
+        json!(targets.iter().map(reqwest::Url::as_str).collect::<Vec<_>>());
     if cancelled.load(Ordering::Relaxed) {
         aggregate["completed"] = json!(false);
         aggregate["passed"] = json!(false);
@@ -686,6 +1149,7 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
         output.join("aggregate.json"),
         format!("{}\n", serde_json::to_string_pretty(&aggregate)?),
     )?;
+    fs::write(output.join("report.md"), render_report(&aggregate))?;
     // Keep the previous SUMMARY destination available alongside the run directory.
     if let Some(legacy) = env::var("SUMMARY").ok().filter(|s| !s.is_empty()) {
         let path = Path::new(&legacy);

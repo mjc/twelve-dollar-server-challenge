@@ -27,6 +27,7 @@ jobs:
         run: |
           cargo build --locked --manifest-path bench/Cargo.toml
           FEED_LOAD_BIN=bench/target/debug/feed-load python3 bench/tests/test_runner.py
+          FEED_LOAD_BIN=bench/target/debug/feed-load python3 bench/tests/test_metrics.py
 
   find:
     runs-on: ubuntu-24.04

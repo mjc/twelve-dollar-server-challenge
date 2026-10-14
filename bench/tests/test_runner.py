@@ -31,7 +31,7 @@ elif args and args[0] == "--run-load":
     (root / "result").write_text(json.dumps({
         "cwd": os.getcwd(), "host": os.environ.get("BASE_URL"),
         "tokens": os.environ.get("TOKENS"), "summary": os.environ.get("SUMMARY"),
-        "source_ips": os.environ.get("SOURCE_IPS"), "args": args[1:],
+        "source_ips": os.environ.get("SOURCE_IPS"), "destination_ports": os.environ.get("DESTINATION_PORTS"), "args": args[1:],
     }))
     sys.exit(7)
 elif name == "git":
@@ -144,11 +144,23 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(any(call[0] == "curl" or call[1:3] == ["toolchain", "install"]
                              for call in self.calls()))
 
+    def test_destination_lists_and_ranges_are_forwarded_from_repo_root(self):
+        for ports, first in [("3100,3102,3104", "3100"), ("3100-3104", "3100"),
+                             ("[3100-3104]", "3100"), ("3100, 3102 - 3104", "3100")]:
+            with self.subTest(ports=ports):
+                run = self.run_runner(self.bench.parent, "127.0.0.1", ports)
+                self.assertEqual(run.returncode, 7, run.stderr)
+                result = json.loads((self.root / "result").read_text())
+                self.assertEqual(result["host"], f"http://127.0.0.1:{first}")
+                self.assertEqual(result["destination_ports"], ports)
+
     def test_invalid_target_stops_before_building(self):
         for args in [["127.0.0.1"], ["127.0.0.1", "0"], ["127.0.0.1", "65536"],
                      ["127.0.0.1", "not-a-port"], ["127.0.0.1/path", "3000"],
                      ["127.0.0.1@192.0.2.1", "3000"], ["127.0.0.1:80", "3000"],
-                     ["127.0.0.999", "3000"], ["010.0.0.1", "3000"], ["::1/path", "3000"]]:
+                     ["127.0.0.999", "3000"], ["010.0.0.1", "3000"], ["::1/path", "3000"],
+                     ["127.0.0.1", "3100,0"], ["127.0.0.1", "3100,"],
+                     ["127.0.0.1", "3100-3099"], ["127.0.0.1", "[3100-3102"]]:
             with self.subTest(args=args):
                 run = self.run_runner(self.bench.parent, *args)
                 self.assertEqual(run.returncode, 2, run.stderr)
@@ -188,7 +200,10 @@ else:
         dest = pathlib.Path(paths[-1])
         if os.environ.get("COLLECT_FAIL") and "@127.0.0.2:" in paths[0]:
             sys.exit(9)
-        shutil.copytree(source, dest, dirs_exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, dest, dirs_exist_ok=True)
+        else:
+            shutil.copy2(source, dest)
 """
 
 
@@ -277,18 +292,31 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_ssh_barrier_collects_all_reports_and_splits_total_users(self):
         self.env["START_DELAY"] = "3"
-        run, report = self.run_coordinator(extra=["--request-log", "native.log"])
+        second = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.server.RequestHandlerClass)
+        second_thread = threading.Thread(target=second.serve_forever, daemon=True)
+        second_thread.start()
+        def stop_second():
+            second.shutdown()
+            second.server_close()
+            second_thread.join()
+        self.addCleanup(stop_second)
+        ports = f"{self.server.server_port},{second.server_port}"
+        run, report = self.run_coordinator(extra=["--request-log", "native.log", "--destination-ports", ports])
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr + str(report))
         self.assertTrue(report["passed"])
         self.assertEqual(report["maximum_users"], 2)
         self.assertGreaterEqual(report["common_hold_s"], 0.75)
         self.assertEqual([w["users"] for w in report["workers"]], [1, 1])
         self.assertEqual([w["user_offset"] for w in report["workers"]], [0, 1])
+        self.assertCountEqual(report["hosts"], [f"http://127.0.0.1:{port}/" for port in [self.server.server_port, second.server_port]])
+        self.assertEqual(report["destination_ports"], [self.server.server_port, second.server_port])
         samples = []
-        for worker in report["workers"]:
+        for index, worker in enumerate(report["workers"]):
             directory = self.root / "results" / worker["name"]
             for filename in ["summary.json", "samples.json", "output.log", "native.log"]:
                 self.assertTrue((directory / filename).exists(), filename)
+            native = json.loads((directory / "summary.json").read_text())
+            self.assertEqual(native["hosts"], [f"http://127.0.0.1:{[self.server.server_port, second.server_port][index]}/"])
             samples.extend(ms for endpoint in json.loads((directory / "samples.json").read_text())
                            for ms in endpoint["latency_ms"])
         self.assertEqual(report["aggregate"]["requests"], len(samples))

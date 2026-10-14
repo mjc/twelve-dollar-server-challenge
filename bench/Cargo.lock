@@ -342,12 +342,16 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "goose",
+ "gumdrop",
  "libc",
  "rand 0.9.5",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "tower",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -654,14 +658,11 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
 ]
 
 [[package]]
 name = "hyper-util"
 version = "0.1.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -1248,7 +1249,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots",
 ]
 
 [[package]]
@@ -1659,7 +1659,6 @@ checksum = "489a59b6730eda1b0171fcfda8b121f4bee2b35cba8645ca35c5f7ba3eb736c1"
 dependencies = [
  "futures-util",
  "log",
- "rustls",
  "tokio",
  "tungstenite",
 ]
