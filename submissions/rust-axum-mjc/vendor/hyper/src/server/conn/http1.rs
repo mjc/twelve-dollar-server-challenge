@@ -373,11 +373,11 @@ impl Builder {
     }
 
     /// Set whether HTTP/1 connections should try to use vectored writes,
-    /// or always flatten into a single buffer.
+    /// or write queued buffers with ordinary scalar writes.
     ///
-    /// Note that setting this to false may mean more copies of body data,
-    /// but may also improve performance when an IO transport doesn't
-    /// support vectored writes well, such as most TLS implementations.
+    /// Setting this to false keeps the body's buffers without copying them
+    /// into the header buffer. Headers and body chunks may require separate
+    /// writes. Pipeline flushing still uses a flattened buffer.
     ///
     /// Setting this to true will force hyper to use queued strategy,
     /// which may eliminate unnecessary cloning on some TLS backends.
@@ -506,7 +506,7 @@ impl Builder {
             if writev {
                 conn.set_write_strategy_queue();
             } else {
-                conn.set_write_strategy_flatten();
+                conn.set_write_strategy_queue_scalar();
             }
         }
         conn.set_flush_pipeline(self.pipeline_flush);

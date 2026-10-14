@@ -46,7 +46,7 @@ cfg_server! {
     use crate::service::HttpService;
 
     pub(crate) struct Server<S: HttpService<B>, B> {
-        in_flight: Pin<Box<Option<S::Future>>>,
+        in_flight: Option<Pin<Box<S::Future>>>,
         pub(crate) service: S,
     }
 }
@@ -570,7 +570,7 @@ cfg_server! {
     {
         pub(crate) fn new(service: S) -> Server<S, B> {
             Server {
-                in_flight: Box::pin(None),
+                in_flight: None,
                 service,
             }
         }
@@ -598,24 +598,25 @@ cfg_server! {
             mut self: Pin<&mut Self>,
             cx: &mut Context<'_>,
         ) -> Poll<Option<Result<(Self::PollItem, Self::PollBody), Self::PollError>>> {
-            let mut this = self.as_mut();
-            let ret = if let Some(fut) = &mut this.in_flight.as_mut().as_pin_mut() {
-                let resp = ready!(fut.as_mut().poll(cx)?);
-                let (parts, body) = resp.into_parts();
-                let head = MessageHead {
-                    version: parts.version,
-                    subject: parts.status,
-                    headers: parts.headers,
-                    extensions: parts.extensions,
+            let this = self.as_mut().get_mut();
+            let result = {
+                let Some(fut) = &mut this.in_flight else {
+                    unreachable!("poll_msg shouldn't be called if no inflight");
                 };
-                Poll::Ready(Some(Ok((head, body))))
-            } else {
-                unreachable!("poll_msg shouldn't be called if no inflight");
+                ready!(fut.as_mut().poll(cx))
             };
 
-            // Since in_flight finished, remove it
-            this.in_flight.set(None);
-            ret
+            // Drop a completed future before returning its response or error.
+            this.in_flight = None;
+            let resp = result?;
+            let (parts, body) = resp.into_parts();
+            let head = MessageHead {
+                version: parts.version,
+                subject: parts.status,
+                headers: parts.headers,
+                extensions: parts.extensions,
+            };
+            Poll::Ready(Some(Ok((head, body))))
         }
 
         fn recv_msg(&mut self, msg: crate::Result<(Self::RecvItem, IncomingBody)>) -> crate::Result<()> {
@@ -627,7 +628,7 @@ cfg_server! {
             *req.version_mut() = msg.version;
             *req.extensions_mut() = msg.extensions;
             let fut = self.service.call(req);
-            self.in_flight.set(Some(fut));
+            self.in_flight = Some(Box::pin(fut));
             Ok(())
         }
 
@@ -772,7 +773,106 @@ mod tests {
     use super::*;
     use crate::common::io::Compat;
     use crate::proto::h1::ClientTransaction;
+    #[cfg(feature = "server")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[cfg(feature = "server")]
+    struct DropTrackedFuture {
+        state: std::sync::Arc<AtomicUsize>,
+        drops: std::sync::Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "server")]
+    impl Future for DropTrackedFuture {
+        type Output = Result<crate::Response<IncomingBody>, std::io::Error>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            match self.state.load(Ordering::Relaxed) {
+                0 => Poll::Pending,
+                1 => Poll::Ready(Ok(crate::Response::new(IncomingBody::empty()))),
+                _ => Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "test service error",
+                ))),
+            }
+        }
+    }
+
+    #[cfg(feature = "server")]
+    impl Drop for DropTrackedFuture {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn server_inflight_future_is_lazy_and_dropped_after_completion() {
+        tokio_test::task::spawn(()).enter(|cx, _| {
+            let state = std::sync::Arc::new(AtomicUsize::new(0));
+            let drops = std::sync::Arc::new(AtomicUsize::new(0));
+            let service = {
+                let state = std::sync::Arc::clone(&state);
+                let drops = std::sync::Arc::clone(&drops);
+                crate::service::service_fn(move |_| DropTrackedFuture {
+                    state: std::sync::Arc::clone(&state),
+                    drops: std::sync::Arc::clone(&drops),
+                })
+            };
+            let mut server = Server::<_, IncomingBody>::new(service);
+
+            assert!(server.in_flight.is_none());
+            assert!(!server.should_poll());
+            assert!(matches!(server.poll_ready(cx), Poll::Ready(Ok(()))));
+
+            server
+                .recv_msg(Ok((RequestHead::default(), IncomingBody::empty())))
+                .unwrap();
+            assert!(server.in_flight.is_some());
+            assert!(server.should_poll());
+            assert!(matches!(Pin::new(&mut server).poll_msg(cx), Poll::Pending));
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+            state.store(1, Ordering::Relaxed);
+            assert!(matches!(
+                Pin::new(&mut server).poll_msg(cx),
+                Poll::Ready(Some(Ok(_)))
+            ));
+            assert!(server.in_flight.is_none());
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+            assert!(matches!(server.poll_ready(cx), Poll::Ready(Ok(()))));
+
+            state.store(2, Ordering::Relaxed);
+            server
+                .recv_msg(Ok((RequestHead::default(), IncomingBody::empty())))
+                .unwrap();
+            assert!(matches!(
+                Pin::new(&mut server).poll_msg(cx),
+                Poll::Ready(Some(Err(_)))
+            ));
+            assert!(server.in_flight.is_none());
+            assert_eq!(drops.load(Ordering::Relaxed), 2);
+
+            state.store(1, Ordering::Relaxed);
+            server
+                .recv_msg(Ok((RequestHead::default(), IncomingBody::empty())))
+                .unwrap();
+            assert!(matches!(
+                Pin::new(&mut server).poll_msg(cx),
+                Poll::Ready(Some(Ok(_)))
+            ));
+            assert_eq!(drops.load(Ordering::Relaxed), 3);
+
+            state.store(0, Ordering::Relaxed);
+            server
+                .recv_msg(Ok((RequestHead::default(), IncomingBody::empty())))
+                .unwrap();
+            assert!(matches!(Pin::new(&mut server).poll_msg(cx), Poll::Pending));
+            drop(server);
+            assert_eq!(drops.load(Ordering::Relaxed), 4);
+        });
+    }
 
     #[test]
     fn client_read_bytes_before_writing_request() {

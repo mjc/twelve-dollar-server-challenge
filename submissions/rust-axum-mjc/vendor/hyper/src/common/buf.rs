@@ -17,6 +17,9 @@ impl<T: Buf> BufList<T> {
     #[inline]
     pub(crate) fn push(&mut self, buf: T) {
         debug_assert!(buf.has_remaining());
+        if self.bufs.capacity() == 0 {
+            self.bufs.reserve_exact(1);
+        }
         self.bufs.push_back(buf);
     }
 
@@ -101,6 +104,23 @@ mod tests {
         BufList {
             bufs: vec![Bytes::from("Hello"), Bytes::from(" "), Bytes::from("World")].into(),
         }
+    }
+
+    #[test]
+    fn first_push_reserves_one_buf_slot() {
+        let mut bufs = BufList::new();
+        assert_eq!(bufs.bufs.capacity(), 0);
+
+        bufs.push(Bytes::from_static(b"first"));
+        assert_eq!(bufs.bufs.capacity(), 1);
+        assert_eq!(bufs.bufs_cnt(), 1);
+        assert_eq!(bufs.chunk(), b"first");
+
+        bufs.push(Bytes::from_static(b"second"));
+        assert_eq!(bufs.bufs_cnt(), 2);
+        assert_eq!(bufs.chunk(), b"first");
+        bufs.advance(5);
+        assert_eq!(bufs.chunk(), b"second");
     }
 
     #[test]

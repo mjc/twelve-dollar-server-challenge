@@ -11,11 +11,11 @@ use futures_core::ready;
 use super::{Http1Transaction, ParseContext, ParsedMessage};
 use crate::common::buf::BufList;
 
-/// The initial buffer size allocated before trying to read from IO.
-pub(crate) const INIT_BUFFER_SIZE: usize = 8192;
+/// The initial adaptive read buffer size.
+pub(crate) const INIT_BUFFER_SIZE: usize = 1024;
 
 /// The minimum value that can be set to max buffer size.
-pub(crate) const MINIMUM_MAX_BUFFER_SIZE: usize = INIT_BUFFER_SIZE;
+pub(crate) const MINIMUM_MAX_BUFFER_SIZE: usize = 8192;
 
 /// The default maximum read buffer size. If the buffer gets this big and
 /// a message is still not complete, a `TooLarge` error is triggered.
@@ -60,7 +60,7 @@ where
         let strategy = if io.is_write_vectored() {
             WriteStrategy::Queue
         } else {
-            WriteStrategy::Flatten
+            WriteStrategy::QueueScalar
         };
         let write_buf = WriteBuf::new(strategy);
         Buffered {
@@ -79,7 +79,7 @@ where
         debug_assert!(!self.write_buf.has_remaining());
         self.flush_pipeline = enabled;
         if enabled {
-            self.set_write_strategy_flatten();
+            self.write_buf.set_strategy(WriteStrategy::Flatten);
         }
     }
 
@@ -97,18 +97,24 @@ where
         self.read_buf_strategy = ReadStrategy::Exact(sz);
     }
 
-    pub(crate) fn set_write_strategy_flatten(&mut self) {
-        // this should always be called only at construction time,
-        // so this assert is here to catch myself
-        debug_assert_eq!(self.write_buf.queue.bufs_cnt(), 0);
-        self.write_buf.set_strategy(WriteStrategy::Flatten);
-    }
-
     pub(crate) fn set_write_strategy_queue(&mut self) {
         // this should always be called only at construction time,
         // so this assert is here to catch myself
         debug_assert_eq!(self.write_buf.queue.bufs_cnt(), 0);
-        self.write_buf.set_strategy(WriteStrategy::Queue);
+        self.write_buf.set_strategy(if self.flush_pipeline {
+            WriteStrategy::Flatten
+        } else {
+            WriteStrategy::Queue
+        });
+    }
+
+    pub(crate) fn set_write_strategy_queue_scalar(&mut self) {
+        debug_assert_eq!(self.write_buf.queue.bufs_cnt(), 0);
+        self.write_buf.set_strategy(if self.flush_pipeline {
+            WriteStrategy::Flatten
+        } else {
+            WriteStrategy::QueueScalar
+        });
     }
 
     pub(crate) fn read_buf(&self) -> &[u8] {
@@ -284,6 +290,9 @@ where
             if let WriteStrategy::Flatten = self.write_buf.strategy {
                 return self.poll_flush_flattened(cx);
             }
+            if let WriteStrategy::QueueScalar = self.write_buf.strategy {
+                return self.poll_flush_queue_scalar(cx);
+            }
 
             const MAX_WRITEV_BUFS: usize = 64;
             loop {
@@ -309,6 +318,25 @@ where
             }
             Pin::new(&mut self.io).poll_flush(cx)
         }
+    }
+
+    /// Flush owned buffers in order without requiring vectored IO.
+    fn poll_flush_queue_scalar(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            let n = ready!(Pin::new(&mut self.io).poll_write(cx, self.write_buf.chunk()))?;
+            self.write_buf.advance(n);
+            debug!("flushed {} bytes", n);
+            if self.write_buf.remaining() == 0 {
+                break;
+            } else if n == 0 {
+                trace!(
+                    "write returned zero, but {} bytes remaining",
+                    self.write_buf.remaining()
+                );
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+        }
+        Pin::new(&mut self.io).poll_flush(cx)
     }
 
     /// Specialized version of `flush` when strategy is Flatten.
@@ -535,7 +563,8 @@ pub(super) struct WriteBuf<B> {
 impl<B: Buf> WriteBuf<B> {
     fn new(strategy: WriteStrategy) -> WriteBuf<B> {
         WriteBuf {
-            headers: Cursor::new(Vec::with_capacity(INIT_BUFFER_SIZE)),
+            // Let encoded headers grow the reusable vec only when a connection writes.
+            headers: Cursor::new(Vec::new()),
             max_buf_size: DEFAULT_MAX_BUFFER_SIZE,
             queue: BufList::new(),
             strategy,
@@ -572,7 +601,7 @@ impl<B: Buf> WriteBuf<B> {
                     buf.advance(adv);
                 }
             }
-            WriteStrategy::Queue => {
+            WriteStrategy::Queue | WriteStrategy::QueueScalar => {
                 trace!(
                     self.len = self.remaining(),
                     buf.len = buf.remaining(),
@@ -586,7 +615,7 @@ impl<B: Buf> WriteBuf<B> {
     fn can_buffer(&self) -> bool {
         match self.strategy {
             WriteStrategy::Flatten => self.remaining() < self.max_buf_size,
-            WriteStrategy::Queue => {
+            WriteStrategy::Queue | WriteStrategy::QueueScalar => {
                 self.queue.bufs_cnt() < MAX_BUF_LIST_BUFFERS && self.remaining() < self.max_buf_size
             }
         }
@@ -649,6 +678,7 @@ impl<B: Buf> Buf for WriteBuf<B> {
 enum WriteStrategy {
     Flatten,
     Queue,
+    QueueScalar,
 }
 
 #[cfg(test)]
@@ -728,18 +758,18 @@ mod tests {
     #[test]
     fn read_strategy_adaptive_increments() {
         let mut strategy = ReadStrategy::default();
-        assert_eq!(strategy.next(), 8192);
+        assert_eq!(strategy.next(), 1024);
 
         // Grows if record == next
-        strategy.record(8192);
-        assert_eq!(strategy.next(), 16384);
+        strategy.record(1024);
+        assert_eq!(strategy.next(), 2048);
 
-        strategy.record(16384);
-        assert_eq!(strategy.next(), 32768);
+        strategy.record(2048);
+        assert_eq!(strategy.next(), 4096);
 
         // Enormous records still increment at same rate
         strategy.record(usize::MAX);
-        assert_eq!(strategy.next(), 65536);
+        assert_eq!(strategy.next(), 8192);
 
         let max = strategy.max();
         while strategy.next() < max {
@@ -754,51 +784,51 @@ mod tests {
     #[test]
     fn read_strategy_adaptive_decrements() {
         let mut strategy = ReadStrategy::default();
-        strategy.record(8192);
-        assert_eq!(strategy.next(), 16384);
+        strategy.record(1024);
+        assert_eq!(strategy.next(), 2048);
 
         strategy.record(1);
         assert_eq!(
             strategy.next(),
-            16384,
+            2048,
             "first smaller record doesn't decrement yet"
         );
-        strategy.record(8192);
-        assert_eq!(strategy.next(), 16384, "record was with range");
+        strategy.record(1024);
+        assert_eq!(strategy.next(), 2048, "record was with range");
 
         strategy.record(1);
         assert_eq!(
             strategy.next(),
-            16384,
+            2048,
             "in-range record should make this the 'first' again"
         );
 
         strategy.record(1);
-        assert_eq!(strategy.next(), 8192, "second smaller record decrements");
+        assert_eq!(strategy.next(), 1024, "second smaller record decrements");
 
         strategy.record(1);
-        assert_eq!(strategy.next(), 8192, "first doesn't decrement");
+        assert_eq!(strategy.next(), 1024, "first doesn't decrement");
         strategy.record(1);
-        assert_eq!(strategy.next(), 8192, "doesn't decrement under minimum");
+        assert_eq!(strategy.next(), 1024, "doesn't decrement under minimum");
     }
 
     #[test]
     fn read_strategy_adaptive_stays_the_same() {
         let mut strategy = ReadStrategy::default();
-        strategy.record(8192);
-        assert_eq!(strategy.next(), 16384);
+        strategy.record(1024);
+        assert_eq!(strategy.next(), 2048);
 
-        strategy.record(8193);
+        strategy.record(1025);
         assert_eq!(
             strategy.next(),
-            16384,
+            2048,
             "first smaller record doesn't decrement yet"
         );
 
-        strategy.record(8193);
+        strategy.record(1025);
         assert_eq!(
             strategy.next(),
-            16384,
+            2048,
             "with current step does not decrement"
         );
     }
@@ -811,7 +841,7 @@ mod tests {
                 strategy.record(usize::MAX);
             }
             let mut next = strategy.next();
-            while next > 8192 {
+            while next > INIT_BUFFER_SIZE {
                 strategy.record(1);
                 strategy.record(1);
                 next = strategy.next();
@@ -891,6 +921,7 @@ mod tests {
         let b = |s: &str| Cursor::new(s.as_bytes().to_vec());
 
         let mut write_buf = WriteBuf::<Cursor<Vec<u8>>>::new(WriteStrategy::Flatten);
+        write_buf.headers.bytes.reserve(INIT_BUFFER_SIZE);
 
         write_buf.buffer(b("hello "));
         write_buf.buffer(b("world, "));
@@ -902,7 +933,7 @@ mod tests {
 
         assert_eq!(write_buf.chunk(), b", ");
         assert_eq!(write_buf.headers.pos, 11);
-        assert_eq!(write_buf.headers.bytes.capacity(), INIT_BUFFER_SIZE);
+        assert!(write_buf.headers.bytes.capacity() >= INIT_BUFFER_SIZE);
 
         // there's still room in the headers buffer, so just push on the end
         write_buf.buffer(b("it's hyper!"));
@@ -917,6 +948,35 @@ mod tests {
         write_buf.buffer(Cursor::new(vec![b'X'; cap]));
         assert_eq!(write_buf.remaining(), cap + rem1);
         assert_eq!(write_buf.headers.pos, 0);
+    }
+
+    #[test]
+    fn lazy_write_headers_preserve_http1_read_and_write_limits() {
+        let strategy = ReadStrategy::default();
+        let write_buf = WriteBuf::<Cursor<Vec<u8>>>::new(WriteStrategy::Flatten);
+
+        assert_eq!(INIT_BUFFER_SIZE, 1024);
+        assert_eq!(strategy.next(), 1024);
+        assert_eq!(strategy.max(), 8192 + 4096 * 100);
+        assert_eq!(write_buf.headers.bytes.capacity(), 0);
+        assert_eq!(write_buf.max_buf_size, 8192 + 4096 * 100);
+        assert_eq!(MINIMUM_MAX_BUFFER_SIZE, 8192);
+
+        let mut scalar = WriteBuf::<Cursor<Vec<u8>>>::new(WriteStrategy::QueueScalar);
+        scalar.buffer(Cursor::new(vec![b'x'; INIT_BUFFER_SIZE * 2]));
+        assert_eq!(scalar.headers.bytes.capacity(), 0);
+        assert_eq!(scalar.queue.remaining(), INIT_BUFFER_SIZE * 2);
+
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(Mock::new().build()));
+        buffered.set_max_buf_size(MINIMUM_MAX_BUFFER_SIZE);
+        assert_eq!(buffered.read_buf_strategy.max(), MINIMUM_MAX_BUFFER_SIZE);
+    }
+
+    #[test]
+    #[should_panic(expected = "The max_buf_size cannot be smaller than 8192.")]
+    fn smaller_initial_buffers_do_not_lower_the_configured_minimum() {
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(Mock::new().build()));
+        buffered.set_max_buf_size(8191);
     }
 
     #[cfg(not(miri))]
@@ -946,6 +1006,132 @@ mod tests {
         buffered.flush().await.expect("flush");
 
         assert_eq!(buffered.write_buf.queue.bufs_cnt(), 0);
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn write_buf_queue_scalar_preserves_order_across_partial_writes_and_pending() {
+        let body = Bytes::from_static(b"world");
+        let body_ptr = body.as_ptr();
+        let mock = Mock::new()
+            .write(b"he")
+            .wait(Duration::from_millis(1))
+            .write(b"llo ")
+            .write(b"wor")
+            .write(b"ld")
+            .build();
+
+        let mut buffered = Buffered::<_, Bytes>::new(Compat::new(mock));
+        buffered.set_write_strategy_queue_scalar();
+        assert_eq!(buffered.write_buf.headers.bytes.capacity(), 0);
+        buffered.headers_buf().extend(b"hello ");
+        let header_capacity = buffered.write_buf.headers.bytes.capacity();
+        buffered.buffer(body);
+        assert_eq!(buffered.write_buf.headers.bytes.capacity(), header_capacity);
+        assert_eq!(buffered.write_buf.queue.bufs_cnt(), 1);
+        assert_eq!(buffered.write_buf.queue.chunk().as_ptr(), body_ptr);
+
+        buffered.flush().await.expect("flush");
+        assert_eq!(buffered.write_buf.remaining(), 0);
+    }
+
+    #[derive(Clone)]
+    struct ScalarWriter {
+        output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        max_write: usize,
+        write_zero: bool,
+    }
+
+    impl tokio::io::AsyncRead for ScalarWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for ScalarWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if this.write_zero {
+                return Poll::Ready(Ok(0));
+            }
+            let len = buf.len().min(this.max_write);
+            this.output.lock().unwrap().extend_from_slice(&buf[..len]);
+            Poll::Ready(Ok(len))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            panic!("scalar queue must not call poll_write_vectored");
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn write_buf_queue_scalar_uses_only_scalar_writes_and_detects_write_zero() {
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = ScalarWriter {
+            output: output.clone(),
+            max_write: 2,
+            write_zero: false,
+        };
+        let mut buffered = Buffered::<_, Bytes>::new(Compat::new(writer));
+        buffered.set_write_strategy_queue_scalar();
+        buffered.headers_buf().extend(b"headers");
+        buffered.buffer(Bytes::from_static(b"body"));
+        buffered.flush().await.expect("partial scalar writes");
+        assert_eq!(&*output.lock().unwrap(), b"headersbody");
+
+        let writer = ScalarWriter {
+            output: Default::default(),
+            max_write: 2,
+            write_zero: true,
+        };
+        let mut buffered = Buffered::<_, Bytes>::new(Compat::new(writer));
+        buffered.set_write_strategy_queue_scalar();
+        buffered.headers_buf().extend(b"body");
+        let error = buffered.flush().await.expect_err("zero write is an error");
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn pipeline_flush_keeps_flatten_strategy_in_either_configuration_order() {
+        let io = Compat::new(Mock::new().build());
+        let mut buffered = Buffered::<_, Bytes>::new(io);
+        buffered.set_write_strategy_queue_scalar();
+        buffered.set_flush_pipeline(true);
+        assert!(matches!(
+            buffered.write_buf.strategy,
+            WriteStrategy::Flatten
+        ));
+
+        buffered.set_write_strategy_queue_scalar();
+        assert!(matches!(
+            buffered.write_buf.strategy,
+            WriteStrategy::Flatten
+        ));
     }
 
     // #[cfg(feature = "nightly")]
