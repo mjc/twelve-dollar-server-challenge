@@ -1,7 +1,9 @@
 # Goose load test
 
 Start your server separately. The runner builds the benchmark tool in release
-mode and runs it against the supplied IP and ports. From the repository root:
+mode and runs it against the supplied IP and ports using HTTP/1.1. HTTPS and TLS
+are outside the benchmark contract and are not compiled into the generator.
+From the repository root:
 
 ```bash
 ./bench/run.sh 127.0.0.1 '3100-3104' --source-ips '127.0.0.[1-5]' --users 75000
@@ -100,8 +102,8 @@ The reports include total and per-endpoint successful/failed requests per second
 connection attempts and establishments per second, and setup durations including
 failed and cancelled attempts. Request rates count requests; connection rates
 count new transport connections. A keep-alive request does not create another
-connection. Connection setup covers DNS, TCP, proxy negotiation, and TLS when
-applicable; an attempt can try several resolved addresses.
+connection. Connection setup covers DNS, TCP, and HTTP proxy negotiation; an
+attempt can try several resolved addresses.
 
 Linux telemetry records per-interface RX/TX throughput and packets per second,
 application/proxy/generator CPU and memory, open descriptors and their limits,
@@ -125,9 +127,8 @@ feed, wait 3–7 seconds, fetch a random post, wait 3–8 seconds, like it with 
 probability, create a post with 2% probability, and idle 5–15 seconds. Each user
 owns an HTTP/1 client and retains its idle connection during think time. A server
 that closes the connection requires that user to reconnect.
-Feed response bodies are consumed and dropped before the user sleeps. Verified
-HTTPS clients share trusted roots and a bounded TLS session cache; a user can
-resume another user's TLS session. HTTP pools and sockets remain separate.
+Feed response bodies are consumed and dropped before the user sleeps. HTTP
+pools and sockets remain separate.
 
 `maximum_users` describes the load stage. Measured established sockets report
 the actual connection concurrency, which can differ during initial jitter,
@@ -156,3 +157,7 @@ On Linux/Android, a local connector patch uses `IP_BIND_ADDRESS_NO_PORT` so
 explicit source binding does not reserve a port before the destination is known.
 This lets the same source port serve distinct destination tuples. Provenance and
 the retained upstream license are in [the connector patch notes](vendor/hyper-util/LOCAL_PATCH.md).
+
+The [Goose patch](vendor/goose/LOCAL_PATCH.md) allows its HTTP-only build by
+gating the certificate option behind TLS features. The generator rejects HTTPS
+targets and TLS-specific options before launching load.

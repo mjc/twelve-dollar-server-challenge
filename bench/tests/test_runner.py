@@ -290,6 +290,22 @@ class CoordinatorTests(unittest.TestCase):
         report = json.loads((self.root / kwargs.get("output", "results") / "aggregate.json").read_text())
         return run, report
 
+    def test_https_targets_and_certificate_options_fail_before_load(self):
+        for args, host in [(self.command(), f"https://127.0.0.1:{self.server.server_port}"),
+                           ([str(self.binary), "--host", f"https://127.0.0.1:{self.server.server_port}"], None),
+                           (self.command(extra=["--", "--accept-invalid-certs"]), None)]:
+            with self.subTest(args=args):
+                env = dict(self.env)
+                if host:
+                    env["BASE_URL"] = host
+                run = subprocess.run(args, env=env, cwd=self.root,
+                                     capture_output=True, text=True, timeout=15)
+                self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+                self.assertIn("TLS", run.stderr)
+                self.assertEqual(self.requests, 0)
+                self.assertFalse((self.root / "results").exists())
+                self.assertFalse((self.root / "calls").exists())
+
     def test_ssh_barrier_collects_all_reports_and_splits_total_users(self):
         self.env["START_DELAY"] = "3"
         second = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.server.RequestHandlerClass)

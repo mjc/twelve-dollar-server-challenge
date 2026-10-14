@@ -255,6 +255,7 @@ fn parse_with(
             return Err("--users must be positive".into());
         }
         super::test_plan(config.users, &config.ramp_up, &config.duration)?;
+        super::destinations::urls(&config.base_url, &config.destination_ports)?;
     }
     Ok(config)
 }
@@ -308,6 +309,12 @@ fn validate_diagnostics(args: &[String]) -> Result<()> {
             .map_or((arg.as_str(), false), |(a, _)| (a, true));
         if flag.starts_with('-') && !flag.starts_with("--") && flag.len() > 2 {
             return Err(format!("combined short flags are unsupported: {flag}; pass each flag separately, such as -v -v").into());
+        }
+        if flag == "--accept-invalid-certs" {
+            return Err(
+                "--accept-invalid-certs is unavailable: this benchmark uses HTTP without TLS"
+                    .into(),
+            );
         }
         if [
             "--host",
@@ -467,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_legacy_environment_settings_fall_back_and_https_uses_its_default_port() {
+    fn empty_legacy_environment_settings_fall_back_and_targets_use_http() {
         let config = parse_args(
             &[],
             &[
@@ -489,8 +496,15 @@ mod tests {
         assert_eq!(config.tokens, PathBuf::from("../seed/tokens.json"));
         assert!(config.source_ips.is_empty());
 
-        let config = parse_args(&[], &[("BASE_URL", "https://example.test")]).unwrap();
-        assert_eq!(config.destination_ports, vec![443]);
+        let config = parse_args(&[], &[("BASE_URL", "http://example.test")]).unwrap();
+        assert_eq!(config.destination_ports, vec![80]);
+        assert!(parse_args(&[], &[("BASE_URL", "https://example.test")]).is_err());
+        // An explicit HTTP target wins over a legacy HTTPS default.
+        assert!(parse_args(
+            &["127.0.0.1", "3100"],
+            &[("BASE_URL", "https://example.test")]
+        )
+        .is_ok());
     }
 
     #[test]
@@ -536,6 +550,7 @@ mod tests {
             vec!["--", "--observe"],
             vec!["--", "--start-supervised"],
             vec!["--", "--refresh-observer"],
+            vec!["--", "--accept-invalid-certs"],
         ] {
             assert!(parse_args(&args, &[]).is_err(), "{args:?}");
         }

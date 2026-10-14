@@ -25,7 +25,6 @@ mod connections;
 mod destinations;
 mod runner;
 mod telemetry;
-mod tls;
 
 const ENDPOINTS: [&str; 4] = [
     "GET /feed",
@@ -227,7 +226,7 @@ async fn configure_client(
         .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
         .unwrap_or(60.0);
     user.set_client_builder(
-        tls::configure(reqwest::Client::builder(), user.config.accept_invalid_certs)
+        reqwest::Client::builder()
             .http1_only()
             .pool_idle_timeout(None)
             .pool_max_idle_per_host(1)
@@ -441,8 +440,12 @@ fn native_metrics_requested(configuration: &goose::config::GooseConfiguration) -
 
 async fn run() -> Result<bool, Box<dyn std::error::Error>> {
     // Parse Goose's CLI first so --help works without seed data.
-    tls::initialize();
     let configuration = goose::config::GooseConfiguration::parse_args_default_or_exit();
+    if configuration.accept_invalid_certs {
+        return Err(
+            "--accept-invalid-certs is unavailable: this benchmark uses HTTP without TLS".into(),
+        );
+    }
     let native_metrics = native_metrics_requested(&configuration);
     let host = if configuration.host.is_empty() {
         setting("BASE_URL", "http://127.0.0.1:3000")

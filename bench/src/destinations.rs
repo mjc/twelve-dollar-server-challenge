@@ -5,8 +5,11 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 pub(super) fn urls(base: &str, ports: &[u16]) -> Result<Vec<Url>> {
     let base = Url::parse(base)?;
-    if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
-        return Err("benchmark target must be an HTTP or HTTPS URL".into());
+    if base.scheme() != "http" || base.host_str().is_none() {
+        return Err(
+            "benchmark target must use http://; HTTPS/TLS is not supported by this benchmark"
+                .into(),
+        );
     }
     if ports.is_empty() {
         return Ok(vec![base]);
@@ -78,13 +81,17 @@ mod tests {
     }
     #[test]
     fn destination_urls_preserve_scheme_ipv6_and_default_ports() {
-        let targets = urls("https://[::1]/base?x=1", &[443, 8443]).unwrap();
-        assert_eq!(targets[0].as_str(), "https://[::1]/base?x=1");
-        assert_eq!(targets[1].as_str(), "https://[::1]:8443/base?x=1");
+        let targets = urls("http://[::1]/base?x=1", &[80, 8080]).unwrap();
+        assert_eq!(targets[0].as_str(), "http://[::1]/base?x=1");
+        assert_eq!(targets[1].as_str(), "http://[::1]:8080/base?x=1");
         assert_eq!(
             urls("http://127.0.0.1:3100", &[]).unwrap()[0].port(),
             Some(3100)
         );
         assert!(urls("ftp://localhost", &[3100]).is_err());
+        assert!(urls("https://localhost", &[443])
+            .unwrap_err()
+            .to_string()
+            .contains("HTTPS/TLS"));
     }
 }
