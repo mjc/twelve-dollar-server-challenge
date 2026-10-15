@@ -62,7 +62,7 @@ of cold old blocks needed for partial-page overwrites.
 Read transactions end before responses are sent, so a slow client does not
 keep a database snapshot open.
 
-Idle connections return read buffers, scalar write-header vectors, and cached
+Idle connections return read buffers, queued write-header vectors, and cached
 header maps to bounded per-thread pools for reuse by active connections. Each
 pool retains at most 128 items; byte buffers larger than 8 KiB and header maps
 with capacity above 32 are discarded. Small empty reads use a stack buffer until
@@ -133,7 +133,11 @@ The profiling tasks can request a range with `BENCH_PORT=3100` and
 `BENCH_PORT_END=3105` in the private benchmark config. The load generator and
 health probe use the first port. A single `BENCH_PORT` keeps one listener.
 
-HTTP/1 vectored writes and pipeline flushing are disabled. `READ_BATCHING`
+On Linux, HTTP/1 vectored writes borrow the queued header and body buffers in
+one syscall when possible. Partial and pending writes keep those buffers until
+the bytes drain; the header vector then returns to the bounded pool. Pipeline
+flushing is disabled. Other platforms keep scalar writes. This write strategy
+has not yet been compared with scalar writes under equivalent load. `READ_BATCHING`
 accepts `true` or `false` and defaults to `true`.
 `SQLITE_MMAP_SIZE` sets the request connection's mmap size in bytes and defaults
 to `0`; startup reports both the requested and effective sizes.

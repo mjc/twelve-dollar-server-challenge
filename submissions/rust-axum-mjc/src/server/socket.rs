@@ -1,7 +1,7 @@
 //! Register with Tokio only when HTTP needs to wait for socket I/O.
 
 use std::{
-    io::{self, Read, Write},
+    io::{self, IoSlice, Read, Write},
     net::{Shutdown, TcpStream},
     pin::Pin,
     task::{Context, Poll},
@@ -78,6 +78,34 @@ impl AsyncRead for Socket {
 }
 
 impl AsyncWrite for Socket {
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match &mut this.stream {
+            Stream::Registered(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Stream::Plain(stream) => {
+                match stream
+                    .as_mut()
+                    .expect("socket missing")
+                    .write_vectored(bufs)
+                {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        this.blocked = true;
+                        Poll::Pending
+                    }
+                    result => Poll::Ready(result),
+                }
+            }
+        }
+    }
+
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

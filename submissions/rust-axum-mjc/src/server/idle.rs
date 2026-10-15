@@ -177,7 +177,7 @@ where
     let mut builder = http1::Builder::new();
     builder
         .header_read_timeout(None)
-        .writev(false)
+        .writev(true)
         .half_close(true);
     let mut idle = IdleSockets::new()?;
     let mut events = Events::with_capacity(IDLE_READY_BATCH);

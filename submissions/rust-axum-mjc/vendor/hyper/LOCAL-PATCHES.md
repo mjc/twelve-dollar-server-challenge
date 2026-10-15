@@ -27,6 +27,12 @@ The scalar queue is implemented in `src/proto/h1/io.rs`, forwarded through
 `src/proto/h1/conn.rs`, and selected by both HTTP/1 connection builders.
 Scalar body queues leave the lazy write-header vector untouched, avoiding its
 previous 1,024-byte per-connection initial reserve.
+The Linux server enables vectored writes over the queued header and body buffers.
+Both queued strategies return empty header vectors to the same bounded pool only
+after all output drains. Hyper borrows a bounded stack array of `IoSlice`s for
+each poll; partial and pending writes retain ownership of the original buffers.
+The deferred socket adapter forwards vectored writes for plain and Tokio sockets.
+This candidate has not been measured against the scalar queue under comparable load.
 `BufList` now requests one element of deque capacity on its first queued body;
 the application returns `Full<Bytes>` bodies as a single data buffer.
 Further streamed buffers still use normal deque growth and preserve ordering.

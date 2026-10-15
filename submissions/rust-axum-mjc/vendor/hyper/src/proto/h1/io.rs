@@ -717,7 +717,11 @@ impl<B: Buf> Buf for WriteBuf<B> {
                 self.queue.advance(qcnt);
             }
         }
-        if matches!(self.strategy, WriteStrategy::QueueScalar) && self.remaining() == 0 {
+        if matches!(
+            self.strategy,
+            WriteStrategy::Queue | WriteStrategy::QueueScalar
+        ) && self.remaining() == 0
+        {
             // Reuse header storage across connections instead of retaining it idle.
             super::pool::recycle_write(&mut self.headers.bytes);
         }
