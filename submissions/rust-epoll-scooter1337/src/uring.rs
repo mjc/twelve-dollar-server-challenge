@@ -63,7 +63,7 @@ impl Default for Tuning {
 }
 
 /// A compact owning buffer. Its allocation never moves while a send is in flight.
-/// Keeping lengths as u32 makes a complete connection fit one 64-byte cache line.
+/// Payload storage stays stable independently of the lazy connection headers.
 #[repr(C)]
 #[derive(Default)]
 struct Buffer {
@@ -146,18 +146,51 @@ impl Drop for Buffer {
         }
     }
 }
-#[repr(C)]
 #[derive(Default)]
-struct Client {
+struct ClientBuffers {
     input: Buffer,
     output: Buffer,
     flight: Buffer,
+}
+#[repr(C)]
+#[derive(Default)]
+struct Client {
+    buffers: Option<Box<ClientBuffers>>,
     sent: u32,
     generation: u32,
     touched: u32,
     state: u32,
 }
-const _: () = assert!(std::mem::size_of::<Client>() == 64);
+const _: () = assert!(std::mem::size_of::<Client>() == 24);
+impl Client {
+    fn buffers_mut(&mut self) -> &mut ClientBuffers {
+        self.buffers.get_or_insert_with(|| Box::default())
+    }
+    fn input_len(&self) -> u32 {
+        self.buffers.as_ref().map_or(0, |b| b.input.len)
+    }
+    fn input_cap(&self) -> u32 {
+        self.buffers.as_ref().map_or(0, |b| b.input.cap)
+    }
+    fn output_len(&self) -> u32 {
+        self.buffers.as_ref().map_or(0, |b| b.output.len)
+    }
+    fn flight_len(&self) -> u32 {
+        self.buffers.as_ref().map_or(0, |b| b.flight.len)
+    }
+    fn take_input(&mut self) -> Buffer {
+        self.buffers
+            .as_mut()
+            .map_or_else(Buffer::default, |b| std::mem::take(&mut b.input))
+    }
+    fn restore_input(&mut self, input: Buffer) {
+        if input.cap != 0 {
+            self.buffers_mut().input = input;
+        } else {
+            assert_eq!(input.len, 0);
+        }
+    }
+}
 
 struct Mapping {
     ptr: NonNull<u8>,
@@ -382,11 +415,12 @@ impl Worker {
             crate::latency_trace::event(id, 5, self.trace_batch, 0);
         }
         let c = &mut self.clients[fd];
-        assert!(c.sent < c.flight.len);
+        let flight = &c.buffers.as_ref().expect("send owns buffers").flight;
+        assert!(c.sent < flight.len);
         let e = opcode::Send::new(
             types::Fixed(fd as u32),
-            unsafe { c.flight.ptr.add(c.sent as usize) },
-            c.flight.len - c.sent,
+            unsafe { flight.ptr.add(c.sent as usize) },
+            flight.len - c.sent,
         )
         .flags(libc::MSG_NOSIGNAL)
         .build()
@@ -457,7 +491,7 @@ impl Worker {
         self.pending.push(Pending {
             fd,
             generation: c.generation,
-            start: c.output.len,
+            start: c.output_len(),
             count: 0,
             interim: false,
         });
@@ -465,14 +499,33 @@ impl Worker {
         index
     }
     fn output(&mut self, fd: usize) {
-        if self.clients[fd].output.cap == 0 {
-            self.clients[fd].output = self.pool.pop().unwrap_or_default();
+        if self.clients[fd].buffers_mut().output.cap == 0 {
+            self.clients[fd].buffers_mut().output = self.pool.pop().unwrap_or_default();
         }
     }
     fn retire(&mut self, mut b: Buffer) {
         b.len = 0;
         if b.cap <= 16384 && self.pool.len() < 256 {
             self.pool.push(b);
+        }
+    }
+    fn release_buffers(&mut self, fd: usize) {
+        let c = &mut self.clients[fd];
+        if c.state & (SENDING | DIRTY) != 0
+            || c.input_len() != 0
+            || c.output_len() != 0
+            || c.flight_len() != 0
+        {
+            return;
+        }
+        let Some(mut buffers) = c.buffers.take() else {
+            return;
+        };
+        self.input_cap_bytes -= buffers.input.cap as usize;
+        for buffer in [&mut buffers.input, &mut buffers.output, &mut buffers.flight] {
+            if buffer.cap != 0 {
+                self.retire(std::mem::take(buffer));
+            }
         }
     }
     fn schedule(&mut self, fd: usize) {
@@ -531,7 +584,7 @@ impl Worker {
         let c = &mut self.clients[fd];
         if c.state & LIVE == 0
             || c.state & (SENDING | SHUT_PENDING | SQL_PENDING) != 0
-            || c.output.len != 0
+            || c.output_len() != 0
         {
             return;
         }
@@ -547,7 +600,7 @@ impl Worker {
         );
         let c = &mut self.clients[fd];
         let generation = c.generation.wrapping_add(1);
-        self.input_cap_bytes -= c.input.cap as usize;
+        self.input_cap_bytes -= c.input_cap() as usize;
         *c = Client {
             generation,
             ..Default::default()
@@ -556,7 +609,7 @@ impl Worker {
     }
     fn process(&mut self, fd: usize, bytes: &[u8]) {
         let process_ns = crate::latency_trace::now();
-        let mut saved = std::mem::take(&mut self.clients[fd].input);
+        let mut saved = self.clients[fd].take_input();
         self.input_cap_bytes -= saved.cap as usize;
         if self.clients[fd].state & (PAUSED | SQL_PENDING | SQL_WAIT) != 0 {
             if saved.len as usize + bytes.len() <= INPUT_LIMIT {
@@ -565,7 +618,8 @@ impl Worker {
                 self.clients[fd].state |= CLOSING;
             }
             self.input_cap_bytes += saved.cap as usize;
-            self.clients[fd].input = saved;
+            self.clients[fd].restore_input(saved);
+            self.release_buffers(fd);
             return;
         }
         let input = if saved.len == 0 {
@@ -627,6 +681,7 @@ impl Worker {
                         let index = self.dirty(fd);
                         self.output(fd);
                         self.clients[fd]
+                            .buffers_mut()
                             .output
                             .extend(b"HTTP/1.1 100 Continue\r\n\r\n");
                         self.pending[index].interim = true;
@@ -638,7 +693,12 @@ impl Worker {
                     error(&mut self.body, 400, "malformed request");
                     let index = self.dirty(fd);
                     self.output(fd);
-                    response(400, &self.body, true, &mut self.clients[fd].output);
+                    response(
+                        400,
+                        &self.body,
+                        true,
+                        &mut self.clients[fd].buffers_mut().output,
+                    );
                     self.pending[index].count += 1;
                     closing = true;
                 }
@@ -651,7 +711,7 @@ impl Worker {
                 saved.consume(offset);
             }
             self.input_cap_bytes += saved.cap as usize;
-            self.clients[fd].input = saved;
+            self.clients[fd].restore_input(saved);
         } else if saved.cap != 0 {
             self.retire(saved);
         }
@@ -659,9 +719,10 @@ impl Worker {
             self.dirty(fd);
             self.clients[fd].state |= CLOSING;
         }
-        if self.clients[fd].output.len as usize >= OUTPUT_HIGH {
+        if self.clients[fd].output_len() as usize >= OUTPUT_HIGH {
             self.pause(fd);
         }
+        self.release_buffers(fd);
     }
     fn on_accept(&mut self, index: usize, generation: u32, result: i32, flags: u32) {
         let listener = &mut self.listeners[index];
@@ -722,7 +783,7 @@ impl Worker {
                 if self.clients[fd].state & CLOSING != 0 {
                     self.close(fd);
                 } else if self.clients[fd].state & (SQL_PENDING | SQL_WAIT) == 0 {
-                    if self.clients[fd].input.len != 0 {
+                    if self.clients[fd].input_len() != 0 {
                         self.schedule(fd);
                     } else {
                         self.clients[fd].state |= CLOSING;
@@ -772,26 +833,26 @@ impl Worker {
         c.touched = self.now;
         if result > 0 {
             c.sent += result as u32;
-            assert!(c.sent <= c.flight.len);
+            assert!(c.sent <= c.flight_len());
         } else {
             c.state |= CLOSING;
-            c.output.len = 0;
-            c.sent = c.flight.len;
+            c.buffers_mut().output.len = 0;
+            c.sent = c.flight_len();
         }
-        if c.sent < c.flight.len {
+        if c.sent < c.flight_len() {
             self.send(fd);
             return;
         }
         self.trace_ids.remove(&fd);
         c.sent = 0;
-        let done = std::mem::take(&mut c.flight);
+        let done = std::mem::take(&mut c.buffers_mut().flight);
         self.retire(done);
         self.dirty(fd);
         if self.clients[fd].state & PAUSED != 0
-            && (self.clients[fd].output.len as usize) < OUTPUT_HIGH / 2
+            && (self.clients[fd].output_len() as usize) < OUTPUT_HIGH / 2
         {
             self.clients[fd].state &= !PAUSED;
-            if self.clients[fd].input.len != 0 {
+            if self.clients[fd].input_len() != 0 {
                 self.schedule(fd);
             }
             if self.clients[fd].state & (RECEIVING | CLOSING) == 0 {
@@ -808,17 +869,19 @@ impl Worker {
                 if c.generation != p.generation || c.state & LIVE == 0 {
                     continue;
                 }
-                c.output.len = p.start;
+                c.buffers_mut().output.len = p.start;
                 for i in 0..p.count {
                     response(
                         500,
                         &self.body,
                         c.state & CLOSING != 0 && i + 1 == p.count,
-                        &mut c.output,
+                        &mut c.buffers_mut().output,
                     );
                 }
                 if p.interim {
-                    c.output.extend(b"HTTP/1.1 100 Continue\r\n\r\n");
+                    c.buffers_mut()
+                        .output
+                        .extend(b"HTTP/1.1 100 Continue\r\n\r\n");
                 }
             }
         }
@@ -832,13 +895,15 @@ impl Worker {
             if c.state & LIVE == 0 || c.state & SENDING != 0 {
                 continue;
             }
-            if c.output.len != 0 {
-                c.flight = std::mem::take(&mut c.output);
+            if c.output_len() != 0 {
+                let buffers = c.buffers_mut();
+                buffers.flight = std::mem::take(&mut buffers.output);
                 c.sent = 0;
                 self.send(fd);
             } else if c.state & CLOSING != 0 {
                 self.close(fd);
             }
+            self.release_buffers(fd);
         }
         self.pending.clear();
     }
@@ -869,7 +934,7 @@ impl Worker {
             self.clients[fd].state &= !SQL_PENDING;
             self.dirty(fd);
             self.output(fd);
-            if self.clients[fd].state & PEER_EOF != 0 && self.clients[fd].input.len == 0 {
+            if self.clients[fd].state & PEER_EOF != 0 && self.clients[fd].input_len() == 0 {
                 self.clients[fd].state |= CLOSING;
             }
             let close = self.clients[fd].state & CLOSING != 0;
@@ -886,9 +951,9 @@ impl Worker {
                 reply.status,
                 &reply.body,
                 close,
-                &mut self.clients[fd].output,
+                &mut self.clients[fd].buffers_mut().output,
             );
-            if !close && self.clients[fd].input.len != 0 {
+            if !close && self.clients[fd].input_len() != 0 {
                 self.schedule(fd);
             }
         }
@@ -985,7 +1050,7 @@ impl Worker {
             if self.now > stats_second {
                 stats_second = self.now;
                 eprintln!(
-                    "RING_STATS ns={} second={} open={} cq={} cq_peak={} rearm={} ready={} sq={} loops={} cqes={} accepts={} recv_ok={} enobufs={} recv_other={} sends={} selected={} sql_wait={} input_cap_bytes={}",
+                    "RING_STATS ns={} second={} open={} cq={} cq_peak={} rearm={} ready={} sq={} loops={} cqes={} accepts={} recv_ok={} enobufs={} recv_other={} sends={} selected={} sql_wait={} input_cap_bytes={} client_slots={} client_capacity={} client_slot_bytes={}",
                     crate::latency_trace::now(),
                     self.now,
                     self.open,
@@ -1004,6 +1069,9 @@ impl Worker {
                     stats[7],
                     self.sql_waiters.len(),
                     self.input_cap_bytes,
+                    self.clients.len(),
+                    self.clients.capacity(),
+                    self.clients.capacity() * std::mem::size_of::<Client>(),
                 );
                 cq_peak = 0;
             }
@@ -1079,11 +1147,11 @@ impl Worker {
                     // Idle keep-alives are retained; only stalled partial input
                     // or blocked output is closed after 120 seconds.
                     if c.state & LIVE != 0
-                        && (c.input.len != 0 || c.flight.len != 0 || c.output.len != 0)
+                        && (c.input_len() != 0 || c.flight_len() != 0 || c.output_len() != 0)
                         && self.now.saturating_sub(c.touched) >= 120
                     {
                         c.state |= CLOSING;
-                        c.output.len = 0;
+                        c.buffers_mut().output.len = 0;
                         self.shutdown(fd);
                         self.close(fd);
                     }
@@ -1387,8 +1455,74 @@ mod sql_tests {
     use std::{io::Read, net::Shutdown, os::unix::net::UnixStream};
 
     #[test]
+    fn idle_headers_are_lazy_and_release_waits_for_send_and_dirty_work() {
+        assert_eq!(std::mem::size_of::<Client>(), 24);
+        assert_eq!(std::mem::size_of::<ClientBuffers>(), 48);
+        let mut w = Worker::new(Vec::new(), 4096, Tuning::default()).unwrap();
+        w.clients.push(Client {
+            state: LIVE | SQL_PENDING,
+            generation: 7,
+            ..Client::default()
+        });
+        w.release_buffers(0);
+        assert!(
+            w.clients[0].buffers.is_none(),
+            "pending SQL alone needs no headers"
+        );
+        let state = w.clients[0].state;
+        w.clients[0].buffers_mut().flight.extend(b"send payload");
+        let pointer = w.clients[0].buffers.as_ref().unwrap().flight.ptr;
+        w.clients[0].state |= SENDING;
+        w.release_buffers(0);
+        assert_eq!(w.clients[0].buffers.as_ref().unwrap().flight.ptr, pointer);
+        w.clients[0].buffers_mut().flight.len = 0;
+        w.release_buffers(0);
+        assert!(
+            w.clients[0].buffers.is_some(),
+            "SENDING retains even empty headers"
+        );
+        w.clients[0].state = state | DIRTY;
+        w.release_buffers(0);
+        assert!(
+            w.clients[0].buffers.is_some(),
+            "pending flush retains headers"
+        );
+        w.clients[0].state = state;
+        w.clients[0].buffers_mut().input.extend_input(b"partial");
+        w.input_cap_bytes = w.clients[0].input_cap() as usize;
+        w.release_buffers(0);
+        assert!(
+            w.clients[0].buffers.is_some(),
+            "partial input retains headers"
+        );
+        w.clients[0].buffers_mut().input.len = 0;
+        w.release_buffers(0);
+        assert!(w.clients[0].buffers.is_none());
+        assert_eq!(w.input_cap_bytes, 0);
+        assert_eq!(
+            w.clients[0].state, state,
+            "header release must preserve SQL/fd state"
+        );
+        assert_eq!(w.clients[0].generation, 7);
+        assert_eq!(
+            w.pool.len(),
+            2,
+            "only nonempty allocations enter the payload pool"
+        );
+    }
+
+    #[test]
     fn gated_sql_recycles_receive_and_preserves_half_closed_pipeline() {
-        assert_eq!(std::mem::size_of::<Client>(), 64);
+        check_gated_pipeline(false);
+    }
+
+    #[test]
+    fn gated_sql_keeps_headers_lazy_until_a_second_receive() {
+        check_gated_pipeline(true);
+    }
+
+    fn check_gated_pipeline(split_receives: bool) {
+        assert_eq!(std::mem::size_of::<Client>(), 24);
         let path = std::env::temp_dir().join(format!("scooter-offload-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let app = Arc::new(Mutex::new(App {
@@ -1413,7 +1547,9 @@ mod sql_tests {
         w.open = 1;
         w.sql = Some(port);
         w.arm_sql();
-        let request = b"GET /health HTTP/1.1\r\nHost: local\r\n\r\nGET /health HTTP/1.1\r\nHost: local\r\n\r\n";
+        let first = b"GET /health HTTP/1.1\r\nHost: local\r\n\r\n";
+        let combined = b"GET /health HTTP/1.1\r\nHost: local\r\n\r\nGET /health HTTP/1.1\r\nHost: local\r\n\r\n";
+        let request = if split_receives { first.as_slice() } else { combined.as_slice() };
         // SAFETY: test owns the receive mapping and this initialized prefix is
         // within buffer0. Inject the same selected-buffer CQE ownership as recv.
         unsafe {
@@ -1435,9 +1571,24 @@ mod sql_tests {
                 "receive buffer must recycle before SQL can run"
             );
         }
-        assert_ne!(w.clients[0].input.len, 0, "pipeline tail must remain owned");
+        if split_receives {
+            assert!(w.clients[0].buffers.is_none(),
+                "a complete borrowed SQL request needs no buffer headers");
+            // A second request arriving while SQL is pending needs owned input.
+            unsafe {
+                ptr::copy_nonoverlapping(first.as_ptr(),
+                    w.recv_memory.ptr.as_ptr().add(BUFSIZE), first.len());
+            }
+            w.on_recv(0, 0, first.len() as i32, 3 | (1 << 16));
+        }
+        assert_ne!(
+            w.clients[0].input_len(),
+            0,
+            "pipeline tail must remain owned"
+        );
         assert_eq!(
-            w.clients[0].input.cap, 256,
+            w.clients[0].input_cap(),
+            256,
             "small input must avoid4KiB padding"
         );
         assert_eq!(w.input_cap_bytes, 256);
@@ -1505,9 +1656,9 @@ mod sql_tests {
             eof,
             "server must close after draining the half-closed pipeline; state={} input={} output={} flight={} bytes={:?}",
             w.clients[0].state,
-            w.clients[0].input.len,
-            w.clients[0].output.len,
-            w.clients[0].flight.len,
+            w.clients[0].input_len(),
+            w.clients[0].output_len(),
+            w.clients[0].flight_len(),
             String::from_utf8_lossy(&bytes)
         );
         let response = String::from_utf8(bytes).unwrap();
