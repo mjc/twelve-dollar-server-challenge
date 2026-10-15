@@ -172,7 +172,7 @@ repository root. Set the token file and both result destinations explicitly:
 
 ```sh
 TOKENS="$PWD/seed/tokens.json" \
-SUMMARY="$PWD/results/goose-summary.json" \
+SUMMARY="$PWD/results/benchmark-summary.json" \
   ../twelve-dollar-benchmark/run.sh 127.0.0.1 3000 --users 1000 \
   --output-dir "$PWD/results/run-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ```
