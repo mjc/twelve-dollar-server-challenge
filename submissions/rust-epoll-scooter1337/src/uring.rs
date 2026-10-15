@@ -1,5 +1,6 @@
 //! Completion-based Linux I/O. Fixed descriptors belong to each ring, rather than
 //! the process file table. SQLite remains serialized behind one batch mutex.
+mod sql;
 use crate::{App, Parsed, error, frame};
 use io_uring::{IoUring, cqueue, opcode, squeue, types};
 use std::{
@@ -29,6 +30,7 @@ const RECV: u64 = 2;
 const SEND: u64 = 3;
 const IGNORE: u64 = 4;
 const SHUTDOWN: u64 = 5;
+const SQL_READY: u64 = 6;
 const LIVE: u32 = 1;
 const RECEIVING: u32 = 2;
 const SENDING: u32 = 4;
@@ -40,7 +42,10 @@ const CONTINUED: u32 = 128;
 const READY: u32 = 256;
 const SHUT_PENDING: u32 = 512;
 const REARM: u32 = 1024;
-const INDEX_SHIFT: u32 = 11;
+const SQL_PENDING: u32 = 2048;
+const SQL_WAIT: u32 = 4096;
+const PEER_EOF: u32 = 8192;
+const INDEX_SHIFT: u32 = 14;
 const FLAG_MASK: u32 = (1 << INDEX_SHIFT) - 1;
 
 #[derive(Clone, Copy)]
@@ -216,6 +221,8 @@ struct Worker {
     trace_ids: std::collections::HashMap<usize, u64>,
     trace_batch: u64,
     trace_active: bool,
+    sql: Option<sql::Port>,
+    sql_waiters: VecDeque<(usize, u32)>,
 }
 fn tag(op: u64, fd: usize, generation: u32) -> u64 {
     op | ((fd as u64) << 8) | ((generation as u64) << 32)
@@ -273,6 +280,8 @@ impl Worker {
             trace_ids: std::collections::HashMap::new(),
             trace_batch: 0,
             trace_active: false,
+            sql: None,
+            sql_waiters: VecDeque::new(),
         };
         if w.buf_ring.is_some() {
             for bid in 0..NBUFS {
@@ -350,6 +359,9 @@ impl Worker {
         }
     }
     fn recv(&mut self, fd: usize) {
+        if self.clients[fd].state & PEER_EOF != 0 {
+            return;
+        }
         let e = opcode::RecvMulti::new(types::Fixed(fd as u32), GROUP)
             .build()
             .user_data(tag(RECV, fd, self.clients[fd].generation));
@@ -509,7 +521,10 @@ impl Worker {
     }
     fn close(&mut self, fd: usize) {
         let c = &mut self.clients[fd];
-        if c.state & LIVE == 0 || c.state & (SENDING | SHUT_PENDING) != 0 || c.output.len != 0 {
+        if c.state & LIVE == 0
+            || c.state & (SENDING | SHUT_PENDING | SQL_PENDING) != 0
+            || c.output.len != 0
+        {
             return;
         }
         if c.state & RECEIVING != 0 {
@@ -530,10 +545,10 @@ impl Worker {
         };
         self.open -= 1;
     }
-    fn process(&mut self, fd: usize, bytes: &[u8], app: &mut App) {
+    fn process(&mut self, fd: usize, bytes: &[u8]) {
         let process_ns = crate::latency_trace::now();
         let mut saved = std::mem::take(&mut self.clients[fd].input);
-        if self.clients[fd].state & PAUSED != 0 {
+        if self.clients[fd].state & (PAUSED | SQL_PENDING | SQL_WAIT) != 0 {
             if saved.len as usize + bytes.len() <= INPUT_LIMIT {
                 saved.extend(bytes);
             } else {
@@ -555,11 +570,8 @@ impl Worker {
             saved.bytes()
         };
         let mut offset = 0;
-        let mut count = 0;
-        let initial = self.clients[fd].output.len;
         let mut closing = false;
-        let mut deferred = false;
-        while offset < input.len() {
+        if offset < input.len() {
             match frame(&input[offset..]) {
                 Ok(Parsed::Complete(req)) => {
                     self.clients[fd].state &= !CONTINUED;
@@ -574,34 +586,33 @@ impl Worker {
                             self.trace_batch,
                             fd as u64,
                         );
-                        crate::latency_trace::event(req.trace_id, 2, self.trace_batch, 0);
                     }
-                    let status = app.serve(&req, &mut self.body);
-                    if req.trace_id != 0 {
-                        crate::latency_trace::event(
-                            req.trace_id,
-                            3,
-                            self.trace_batch,
-                            status as u64,
-                        );
+                    let port = self.sql.as_ref().expect("SQL port");
+                    if !port.submit(|| sql::Job {
+                        ring: port.id,
+                        fd,
+                        generation: self.clients[fd].generation,
+                        request: sql::Request::copy(&req),
+                        batch: self.trace_batch,
+                        queued: Instant::now(),
+                    }) {
+                        // Backpressure without rejecting a request or retaining a
+                        // provided receive buffer. Resume only after SQL progress.
+                        self.clients[fd].state |= SQL_WAIT;
+                        self.sql_waiters
+                            .push_back((fd, self.clients[fd].generation));
+                    } else {
+                        self.clients[fd].state |= SQL_PENDING;
+                        offset += req.consumed;
+                        closing = req.close;
                     }
-                    let index = self.dirty(fd);
-                    self.output(fd);
-                    response(status, &self.body, req.close, &mut self.clients[fd].output);
-                    self.pending[index].count += 1;
-                    count += 1;
-                    offset += req.consumed;
-                    if req.close {
-                        closing = true;
-                        break;
-                    }
-                    if count >= 64 || self.clients[fd].output.len - initial >= 262144 {
-                        deferred = offset < input.len();
-                        break;
-                    }
+                    // One outstanding SQL request per connection preserves HTTP
+                    // pipeline order without adding idle per-connection storage.
                 }
                 Ok(Parsed::Incomplete { expect_continue }) => {
-                    if expect_continue && self.clients[fd].state & CONTINUED == 0 {
+                    if self.clients[fd].state & PEER_EOF != 0 {
+                        closing = true;
+                    } else if expect_continue && self.clients[fd].state & CONTINUED == 0 {
                         let index = self.dirty(fd);
                         self.output(fd);
                         self.clients[fd]
@@ -610,7 +621,6 @@ impl Worker {
                         self.pending[index].interim = true;
                         self.clients[fd].state |= CONTINUED;
                     }
-                    break;
                 }
                 Err(()) => {
                     self.body.clear();
@@ -620,7 +630,6 @@ impl Worker {
                     response(400, &self.body, true, &mut self.clients[fd].output);
                     self.pending[index].count += 1;
                     closing = true;
-                    break;
                 }
             }
         }
@@ -635,13 +644,11 @@ impl Worker {
             self.retire(saved);
         }
         if closing {
+            self.dirty(fd);
             self.clients[fd].state |= CLOSING;
         }
         if self.clients[fd].output.len as usize >= OUTPUT_HIGH {
             self.pause(fd);
-        }
-        if deferred {
-            self.schedule(fd);
         }
     }
     fn on_accept(&mut self, index: usize, generation: u32, result: i32, flags: u32) {
@@ -674,7 +681,7 @@ impl Worker {
             self.stop_accept();
         }
     }
-    fn on_recv(&mut self, fd: usize, generation: u32, result: i32, flags: u32, app: &mut App) {
+    fn on_recv(&mut self, fd: usize, generation: u32, result: i32, flags: u32) {
         let selected = cqueue::buffer_select(flags);
         let valid = fd < self.clients.len()
             && self.clients[fd].generation == generation
@@ -696,7 +703,19 @@ impl Worker {
                             result as usize,
                         )
                     };
-                    self.process(fd, bytes, app);
+                    self.process(fd, bytes);
+                }
+            } else if result == 0 {
+                self.clients[fd].state |= PEER_EOF;
+                if self.clients[fd].state & CLOSING != 0 {
+                    self.close(fd);
+                } else if self.clients[fd].state & (SQL_PENDING | SQL_WAIT) == 0 {
+                    if self.clients[fd].input.len != 0 {
+                        self.schedule(fd);
+                    } else {
+                        self.clients[fd].state |= CLOSING;
+                        self.close(fd);
+                    }
                 }
             } else if (result != -libc::ENOBUFS && result != -libc::ECANCELED)
                 || self.clients[fd].state & CLOSING != 0
@@ -811,7 +830,81 @@ impl Worker {
         }
         self.pending.clear();
     }
-    fn run(mut self, shared: Arc<Mutex<App>>) -> ! {
+    fn arm_sql(&mut self) {
+        let fd = self.sql.as_ref().unwrap().wake.as_raw_fd();
+        self.queue(
+            opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as u32)
+                .build()
+                .user_data(SQL_READY),
+        );
+    }
+    fn sql_ready(&mut self, result: i32) {
+        assert!(result >= 0, "SQL wake: {result}");
+        self.sql.as_ref().unwrap().drain_wake();
+        let mut count = 0;
+        while count < 1024 {
+            let Some(reply) = self.sql.as_ref().unwrap().reply() else {
+                break;
+            };
+            count += 1;
+            if reply.fd >= self.clients.len()
+                || self.clients[reply.fd].generation != reply.generation
+                || self.clients[reply.fd].state & LIVE == 0
+            {
+                continue;
+            }
+            let fd = reply.fd;
+            self.clients[fd].state &= !SQL_PENDING;
+            self.dirty(fd);
+            self.output(fd);
+            if self.clients[fd].state & PEER_EOF != 0 && self.clients[fd].input.len == 0 {
+                self.clients[fd].state |= CLOSING;
+            }
+            let close = self.clients[fd].state & CLOSING != 0;
+            if reply.trace[0] != 0 {
+                let [id, batch, begin, end, commit_begin, commit_end] = reply.trace;
+                crate::latency_trace::at(begin, id, 2, batch, 0);
+                crate::latency_trace::at(end, id, 3, batch, reply.status as u64);
+                // Per-request commit boundaries use new kinds16/17. These must
+                // not masquerade as ring batch13/14 events from the old design.
+                crate::latency_trace::at(commit_begin, id, 16, batch, 0);
+                crate::latency_trace::at(commit_end, id, 17, batch, 0);
+            }
+            response(
+                reply.status,
+                &reply.body,
+                close,
+                &mut self.clients[fd].output,
+            );
+            if !close && self.clients[fd].input.len != 0 {
+                self.schedule(fd);
+            }
+        }
+        // If this fairness batch filled, wake again even if the writer has no
+        // further work. A harmless extra wake avoids stranding completed replies.
+        if count == 1024 {
+            self.sql.as_ref().unwrap().notify();
+        }
+        if !self.sql_waiters.is_empty() {
+            for _ in 0..self.sql_waiters.len().min(128) {
+                let (fd, generation) = self.sql_waiters.pop_front().unwrap();
+                if self.clients[fd].generation != generation {
+                    continue;
+                }
+                self.clients[fd].state &= !SQL_WAIT;
+                if self.clients[fd].state & LIVE != 0 {
+                    self.schedule(fd);
+                }
+            }
+        }
+        if !self.sql_waiters.is_empty() && self.sql.as_ref().unwrap().has_capacity() {
+            self.sql.as_ref().unwrap().notify();
+        }
+        self.arm_sql();
+    }
+    fn run(mut self, port: sql::Port) -> ! {
+        self.sql = Some(port);
+        self.arm_sql();
         let mut last_count = 0;
         let mut sweep = 0;
         // Diagnostic only: 0 restores the original complete CQ drain.
@@ -873,20 +966,34 @@ impl Worker {
                     RECV if result == -libc::ENOBUFS => stats[4] += 1,
                     RECV => stats[5] += 1,
                     SEND => stats[6] += 1,
-                    _ => {},
+                    _ => {}
                 }
                 stats[7] += u64::from(cqueue::buffer_select(flags).is_some());
             }
             if self.now > stats_second {
                 stats_second = self.now;
-                eprintln!("RING_STATS ns={} second={} open={} cq={} cq_peak={} rearm={} ready={} sq={} loops={} cqes={} accepts={} recv_ok={} enobufs={} recv_other={} sends={} selected={}",
-                    crate::latency_trace::now(), self.now, self.open, cq_len, cq_peak,
-                    self.rearm.len(), self.ready.len(), self.ring.submission().len(),
-                    stats[0], stats[1], stats[2], stats[3], stats[4], stats[5], stats[6], stats[7]);
+                eprintln!(
+                    "RING_STATS ns={} second={} open={} cq={} cq_peak={} rearm={} ready={} sq={} loops={} cqes={} accepts={} recv_ok={} enobufs={} recv_other={} sends={} selected={}",
+                    crate::latency_trace::now(),
+                    self.now,
+                    self.open,
+                    cq_len,
+                    cq_peak,
+                    self.rearm.len(),
+                    self.ready.len(),
+                    self.ring.submission().len(),
+                    stats[0],
+                    stats[1],
+                    stats[2],
+                    stats[3],
+                    stats[4],
+                    stats[5],
+                    stats[6],
+                    stats[7]
+                );
                 cq_peak = 0;
             }
             let collected_ns = crate::latency_trace::now();
-            let mut app = shared.lock().unwrap();
             let ready = self.ready.len().min(128);
             for _ in 0..ready {
                 let (fd, generation) = self.ready.pop_front().unwrap();
@@ -895,7 +1002,7 @@ impl Worker {
                 }
                 self.clients[fd].state &= !READY;
                 if self.clients[fd].state & (LIVE | CLOSING | PAUSED) == LIVE {
-                    self.process(fd, &[], &mut app);
+                    self.process(fd, &[]);
                 }
             }
             for i in 0..self.completions.len() {
@@ -904,35 +1011,28 @@ impl Worker {
                 let generation = (tag >> 32) as u32;
                 match tag & 255 {
                     ACCEPT => self.on_accept(fd, generation, result, flags),
-                    RECV => self.on_recv(fd, generation, result, flags, &mut app),
+                    RECV => self.on_recv(fd, generation, result, flags),
                     SEND => self.on_send(fd, generation, result),
                     SHUTDOWN => self.on_shutdown(fd, generation, result),
+                    SQL_READY => self.sql_ready(result),
                     _ => {}
                 }
             }
             self.publish_buffers();
-            let commit_begin = crate::latency_trace::now();
-            let committed = app.db.commit();
-            let commit_end = crate::latency_trace::now();
-            self.flush(committed);
+            self.flush(true);
             let flushed_ns = crate::latency_trace::now();
             if self.trace_active {
                 for (kind, ns) in [
                     (10, loop_ns),
                     (11, submitted_ns),
                     (12, collected_ns),
-                    (13, commit_begin),
-                    (14, commit_end),
                     (15, flushed_ns),
                 ] {
                     crate::latency_trace::at(ns, 0, kind, self.trace_batch, last_count as u64);
                 }
             }
             crate::latency_trace::maybe_dump();
-            drop(app);
-            if !self.rearm.is_empty()
-                && (!rearm_after_drain || self.ring.completion().is_empty())
-            {
+            if !self.rearm.is_empty() && (!rearm_after_drain || self.ring.completion().is_empty()) {
                 let returned = self
                     .completions
                     .iter()
@@ -1233,8 +1333,8 @@ pub fn run(address: &str, app: App, tuning: Tuning) -> io::Result<()> {
         listeners.push(listener);
     }
     let shared = Arc::new(Mutex::new(app));
-    for id in 0..workers {
-        let app = Arc::clone(&shared);
+    let ports = sql::start(shared, workers)?;
+    for (id, port) in ports.into_iter().enumerate() {
         let fds = listeners.iter().map(AsRawFd::as_raw_fd).collect();
         let (tx, rx) = mpsc::sync_channel(1);
         std::thread::Builder::new()
@@ -1246,7 +1346,7 @@ pub fn run(address: &str, app: App, tuning: Tuning) -> io::Result<()> {
                     match w.ring.submit() {
                         Ok(_) => {
                             tx.send(Ok(())).unwrap();
-                            w.run(app);
+                            w.run(port);
                         }
                         Err(e) => {
                             let _ = tx.send(Err(e));
@@ -1264,5 +1364,220 @@ pub fn run(address: &str, app: App, tuning: Tuning) -> io::Result<()> {
     );
     loop {
         std::thread::park_timeout(Duration::from_secs(3600));
+    }
+}
+
+#[cfg(test)]
+mod sql_tests {
+    use super::*;
+    use std::{io::Read, net::Shutdown, os::unix::net::UnixStream};
+
+    #[test]
+    fn gated_sql_recycles_receive_and_preserves_half_closed_pipeline() {
+        assert_eq!(std::mem::size_of::<Client>(), 64);
+        let path = std::env::temp_dir().join(format!("scooter-offload-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let app = Arc::new(Mutex::new(App {
+            db: crate::db::test_fixture(path.to_str().unwrap()),
+            auth: crate::Auth::new("test-secret"),
+            start: Instant::now(),
+        }));
+        let gate = app.lock().unwrap();
+        let port = sql::start(Arc::clone(&app), 1).unwrap().remove(0);
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut w = Worker::new(Vec::new(), 4096, Tuning::default()).unwrap();
+        w.ring
+            .submitter()
+            .register_files_update(0, &[socket.as_raw_fd()])
+            .unwrap();
+        drop(socket); // Only the registered fixed slot now owns the server end.
+        w.clients.push(Client {
+            state: LIVE | RECEIVING,
+            ..Client::default()
+        });
+        w.open = 1;
+        w.sql = Some(port);
+        w.arm_sql();
+        let request = b"GET /health HTTP/1.1\r\nHost: local\r\n\r\nGET /health HTTP/1.1\r\nHost: local\r\n\r\n";
+        // SAFETY: test owns the receive mapping and this initialized prefix is
+        // within buffer0. Inject the same selected-buffer CQE ownership as recv.
+        unsafe {
+            ptr::copy_nonoverlapping(request.as_ptr(), w.recv_memory.ptr.as_ptr(), request.len());
+        }
+        let old_tail = w.tail;
+        w.on_recv(0, 0, request.len() as i32, 3); // BUFFER | MORE, buffer id0.
+        assert_ne!(w.clients[0].state & SQL_PENDING, 0);
+        if w.buf_ring.is_some() {
+            assert_eq!(
+                w.tail,
+                old_tail.wrapping_add(1),
+                "receive buffer must recycle before SQL can run"
+            );
+        } else {
+            assert_eq!(
+                w.returned,
+                [0],
+                "receive buffer must recycle before SQL can run"
+            );
+        }
+        assert_ne!(w.clients[0].input.len, 0, "pipeline tail must remain owned");
+        peer.shutdown(Shutdown::Write).unwrap();
+        w.on_recv(0, 0, 0, 0);
+        assert_ne!(w.clients[0].state & LIVE, 0, "pending SQL retains the slot");
+        w.queue(opcode::Nop::new().build().user_data(IGNORE));
+        w.ring.submit_and_wait(1).unwrap();
+        assert!(
+            w.ring.completion().any(|c| c.user_data() == IGNORE),
+            "ring completion work must progress while SQL is gated"
+        );
+        assert!(w.sql.as_ref().unwrap().reply().is_none());
+        drop(gate);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut bytes = Vec::new();
+        let mut eof = false;
+        while Instant::now() < deadline && !eof {
+            while let Some((fd, generation)) = w.ready.pop_front() {
+                if w.clients[fd].generation == generation {
+                    w.clients[fd].state &= !READY;
+                    w.process(fd, &[]);
+                }
+            }
+            let timeout = types::Timespec::new().nsec(1_000_000);
+            let result = w
+                .ring
+                .submitter()
+                .submit_with_args(1, &types::SubmitArgs::new().timespec(&timeout));
+            if let Err(e) = result {
+                assert!(
+                    matches!(e.raw_os_error(), Some(libc::ETIME | libc::EINTR)),
+                    "{e}"
+                );
+            }
+            let cqes: Vec<_> = w
+                .ring
+                .completion()
+                .map(|c| (c.user_data(), c.result()))
+                .collect();
+            for (tag, result) in cqes {
+                match tag & 255 {
+                    SQL_READY => w.sql_ready(result),
+                    SEND => w.on_send(((tag >> 8) & 0xffffff) as usize, (tag >> 32) as u32, result),
+                    SHUTDOWN => w.on_shutdown(0, 0, result),
+                    _ => {}
+                }
+            }
+            w.flush(true);
+            let mut scratch = [0u8; 4096];
+            loop {
+                match peer.read(&mut scratch) {
+                    Ok(0) => {
+                        eof = true;
+                        break;
+                    }
+                    Ok(n) => bytes.extend_from_slice(&scratch[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("peer: {e}"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            eof,
+            "server must close after draining the half-closed pipeline; state={} input={} output={} flight={} bytes={:?}",
+            w.clients[0].state,
+            w.clients[0].input.len,
+            w.clients[0].output.len,
+            w.clients[0].flight.len,
+            String::from_utf8_lossy(&bytes)
+        );
+        let response = String::from_utf8(bytes).unwrap();
+        assert_eq!(response.matches("HTTP/1.1 200 OK").count(), 2, "{response}");
+        assert_eq!(
+            response.matches("\"status\":\"ok\"").count(),
+            2,
+            "{response}"
+        );
+        assert_eq!(w.open, 0);
+        drop(w);
+        drop(app);
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod sql_wait_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn stale_waiters_cannot_strand_a_live_waiter_after_capacity_wake() {
+        let path = std::env::temp_dir().join(format!("scooter-waiters-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let app = Arc::new(Mutex::new(App {
+            db: crate::db::test_fixture(path.to_str().unwrap()),
+            auth: crate::Auth::new("test-secret"),
+            start: Instant::now(),
+        }));
+        // Two ports model one ring freeing global capacity while the other has
+        // only waiters and therefore no SQL reply of its own to wake it again.
+        let mut ports = sql::start(app, 2).unwrap();
+        let port = ports.pop().unwrap();
+        let mut w = Worker::new(Vec::new(), 4096, Tuning::default()).unwrap();
+        w.sql = Some(port);
+        w.clients.push(Client {
+            state: LIVE | SQL_WAIT,
+            generation: 1,
+            ..Client::default()
+        });
+        for _ in 0..130 {
+            w.sql_waiters.push_back((0, 0));
+        }
+        w.sql_waiters.push_back((0, 1));
+        w.sql_ready(i32::from(libc::POLLIN));
+        assert_eq!(w.sql_waiters.len(), 3);
+        // The first fairness slice contains only stale entries. It must arrange
+        // another wake without relying on any future SQL completion.
+        w.ring.submit_and_wait(1).unwrap();
+        let events: Vec<_> = w
+            .ring
+            .completion()
+            .map(|c| (c.user_data(), c.result()))
+            .collect();
+        assert!(events.iter().any(|(tag, _)| *tag == SQL_READY));
+        for (tag, result) in events {
+            if tag == SQL_READY {
+                w.sql_ready(result);
+            }
+        }
+        assert!(w.sql_waiters.is_empty());
+        assert_eq!(w.clients[0].state & SQL_WAIT, 0);
+        assert_eq!(w.ready.front(), Some(&(0, 1)));
+        drop(w);
+        drop(ports);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn final_receive_retires_already_closing_sql_waiter() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let mut w = Worker::new(Vec::new(), 4096, Tuning::default()).unwrap();
+        w.ring
+            .submitter()
+            .register_files_update(0, &[socket.as_raw_fd()])
+            .unwrap();
+        drop(socket);
+        w.clients.push(Client {
+            state: LIVE | RECEIVING | CLOSING | SHUT | SQL_WAIT,
+            ..Client::default()
+        });
+        w.open = 1;
+        w.on_recv(0, 0, 0, 0);
+        assert_eq!(
+            w.open, 0,
+            "no SQL job owns this slot; EOF must finish retirement"
+        );
+        assert_eq!(w.clients[0].state & LIVE, 0);
+        w.ring.submit().unwrap();
     }
 }

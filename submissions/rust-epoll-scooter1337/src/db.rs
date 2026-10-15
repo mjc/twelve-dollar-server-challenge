@@ -532,3 +532,30 @@ fn append_post_with_likes(stmt: &Stmt, likes: u64, out: &mut Vec<u8>) {
     crate::number(likes, out);
     out.push(b'}');
 }
+
+#[cfg(test)]
+pub(crate) fn test_fixture(path: &str) -> Db {
+    let path_c = CString::new(path).unwrap();
+    let mut raw = ptr::null_mut();
+    // SAFETY: temporary test connection is exclusively owned here; the schema
+    // and path are valid terminated strings and no statements outlive close.
+    unsafe {
+        assert_eq!(
+            sqlite3_open_v2(path_c.as_ptr(), &mut raw, 6 | 0x8000, ptr::null()),
+            0
+        );
+        let schema = CString::new(include_str!("../../../schema.sql")).unwrap();
+        assert_eq!(
+            sqlite3_exec(
+                raw,
+                schema.as_ptr(),
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!(sqlite3_close(raw), 0);
+    }
+    Db::open(path, true)
+}
