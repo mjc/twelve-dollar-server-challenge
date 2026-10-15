@@ -7,20 +7,24 @@ publish = false
 license = "MIT"
 
 [dependencies]
-axum = "=0.8.9"
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 bytes = "=1.12.1"
-rusqlite = { version = "=0.40.2", features = ["bundled"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
+hyper = { version = "=1.12.0", features = ["http1", "server"] }
+hyper-util = { version = "=0.1.21", features = ["http1", "server-graceful", "service", "tokio"] }
+libc = "=0.2.190"
+http-body-util = "=0.1.5"
+rusqlite = { version = "=0.40.2", features = ["bundled", "hooks"] }
 jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["rust_crypto"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.151", features = ["raw_value"] }
-tokio = { version = "=1.53.2", features = ["macros", "net", "rt", "signal", "sync", "time"] }
+tokio = { version = "=1.53.2", features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+tower = { version = "=0.5.3", features = ["make", "util"] }
 
 [dev-dependencies]
 divan = "=0.1.21"
 gungraun = { version = "=0.20.0", features = ["act"] }
-http-body-util = "=0.1.5"
 tempfile = "=3.27.0"
-tower = { version = "=0.5.3", features = ["util"] }
 
 [profile.bench]
 debug = 2
