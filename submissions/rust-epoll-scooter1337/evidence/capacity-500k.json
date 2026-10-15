@@ -1,0 +1,122 @@
+{
+  "binary_sha256": "77412ab79a14ee3a03b9d4d50173f58397e1be5bcb986caca278daa9a0dcfb2d",
+  "settings": "Frozen77412ab7/header24/cache256/mmap0/SQLworker/CQ32/retry1/wait25/inputfloor256/idlePASSIVE, fresh supplied seed; unbenchmarked cf00c3b and cache32 excluded. No source/rebuild/schema/query-result-cache/host changes.",
+  "measurement": {
+    "workload": {
+      "users": 500000,
+      "timestamps": {
+        "started_at": "2026-10-15T14:07:26.135625251Z",
+        "hold_started_at": "2026-10-15T14:08:26.136040438Z",
+        "hold_finished_at": "2026-10-15T14:09:26.137678304Z",
+        "finished_at": "2026-10-15T14:10:06.190091425Z"
+      },
+      "requests": 5963637,
+      "failed": 0,
+      "p95_ms": 123.41163080000089,
+      "p99_ms": 645.8111773599987,
+      "connections": {
+        "attempts": 500000,
+        "established": 500000,
+        "failed": 0,
+        "cancelled": 0
+      },
+      "hold_CPU_percent": 62.05370207946291,
+      "CPU_sample_duration_s": 58.06499981880188,
+      "full_TCP_scope": "Nominal60s VU hold includes initial0-5s think; do not equate to60s allTCP."
+    },
+    "layout": {
+      "optimized_DWARF_Client_bytes": 24,
+      "optimized_DWARF_ClientBuffers_bytes": 48,
+      "observed_capacity": 524288,
+      "observed_slot_payload_bytes": 12582912,
+      "same_capacity_old_64B_counterfactual_bytes": 33554432,
+      "fixed_payload_saving_bytes": 20971520,
+      "limits": "Exact layout/capacity payload difference, not isolated RSS saving. Active boxes and allocator metadata cost extra. Comparable pass versus failure supports capacity improvement, not an isolated speedup or deterministic safety guarantee."
+    },
+    "memory": {
+      "limit_bytes": 2147483648,
+      "events": {
+        "low": 0,
+        "high": 0,
+        "max": 61249,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "full_samples": 56,
+      "full_kernel_median_bytes": 2016696320.0,
+      "full_anon_median_bytes": 68673536.0,
+      "full_anon_max_bytes": 81674240,
+      "full_clean_file_min_bytes": 1785856,
+      "full_derived_margin_min_bytes": 3522560,
+      "matching": "Memory rows matched within1.1s of RING open500000; asynchronous one-second counters, not guaranteed instantaneous reserve. Derived = cap-anon-kernel-sock-dirty-writeback, clean=file-dirty-writeback. Do not add file twice.",
+      "worst_sample_unix_s": 1792073353.1309469,
+      "worst_sample_bytes": {
+        "anon": 74182656,
+        "kernel": 2018357248,
+        "sock": 53248,
+        "file": 53153792,
+        "file_dirty": 51367936,
+        "file_writeback": 0
+      },
+      "next_decision": "Do not add1k (~4MB projected kernel) to only3.52MB derived/1.79MB clean margin. Repeat500k with cache target256 to32MiB and startup readback: measured pager62.18MB is a live owner, so cache64 would not materially cap it. Actual saving/misses/I/O/latency unmeasured."
+    },
+    "remaining_tail": {
+      "evidence": "SQL thread observed in balance_dirty_pages at14:09:13.131Z; COMMIT998.825ms and pending51829 reported next second during hold. During drain maxCOMMIT1001.307ms. No traffic checkpoint. Slow syscall threshold10ms sees WAL pwrite max228.297ms at monotonic232651.413738 (~6s after hold).",
+      "largest_IO": [
+        {
+          "start_ns": 232651413738052,
+          "end_ns": 232651642036838,
+          "tid": 1803122,
+          "syscall": 18,
+          "fd": 4,
+          "length": 24,
+          "offset": 4688819592,
+          "result": 24,
+          "duration_ns": 228297136
+        },
+        {
+          "start_ns": 232653045532860,
+          "end_ns": 232653258054167,
+          "tid": 1803122,
+          "syscall": 18,
+          "fd": 4,
+          "length": 24,
+          "offset": 4764536952,
+          "result": 24,
+          "duration_ns": 212519607
+        },
+        {
+          "start_ns": 232655419308572,
+          "end_ns": 232655629036669,
+          "tid": 1803122,
+          "syscall": 18,
+          "fd": 4,
+          "length": 24,
+          "offset": 4869695832,
+          "result": 24,
+          "duration_ns": 209726607
+        },
+        {
+          "start_ns": 232658425364474,
+          "end_ns": 232658635047708,
+          "tid": 1803122,
+          "syscall": 18,
+          "fd": 4,
+          "length": 24,
+          "offset": 4998029712,
+          "result": 24,
+          "duration_ns": 209681674
+        }
+      ],
+      "limits": "Dirty throttling and COMMIT/queue correlation explain a remaining tail mechanism, not each request. Device/controller threshold and isolated causal shares not established; HTTP pass does not mean storage stalls eliminated."
+    },
+    "artifacts": {
+      "generator": "/home/mjc/projects/twelve-dollar-benchmark-no-goose/results/tali-scooter-lazyclient-header24-slotstats-mmap0-cache256-cq32-retry1-500000-20261015T140502Z/run",
+      "profile": "/home/mjc/projects/twelve-dollar-benchmark-no-goose/results/tali-scooter-lazyclient-header24-slotstats-mmap0-cache256-cq32-retry1-500000-20261015T140502Z/profile",
+      "remote_profile": "/home/mjc/bench/scooter-pr82-63eeda66/profiles/500k-20261015T140502Z"
+    }
+  },
+  "original_evidence_commit": "8a4f9278bcf60cae7b72013b4ce0175adb64b9dc",
+  "rewrite_note": "Condensed original evidence; original author identity/date preserved. Full original signed history and artifacts remain backed up."
+}
