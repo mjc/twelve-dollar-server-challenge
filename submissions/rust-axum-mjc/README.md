@@ -2,10 +2,18 @@
 
 The five challenge endpoints use a native Hyper service with Axum request
 extraction, a current-thread Tokio runtime, and one dedicated SQLite worker.
-The connection task maps completion directly onto error logging, avoiding an
-async wrapper that duplicated the stored connection future. Hyper uses Tokio sockets directly
-through its native adapter, avoiding a second transport buffer and boxed
-completion-I/O futures for reads and flushes.
+On Linux, idle TCP connections keep a standard socket and their service handle
+in a shared map. One epoll instance reports activity through a single Tokio
+registration. Hyper state, a Tokio socket registration, and a task exist only
+while a connection is active. After Hyper has finished the request and flushed
+the response, the socket and service return to idle storage. Partial requests,
+pipelined input, pending handlers, and unfinished writes stay active.
+Each idle registration receives a fresh token that is never reused, so a stale
+readiness event cannot select a new connection that reused its file descriptor.
+Active sessions have separate Tokio tasks and scheduling budgets. Readiness
+batches contain at most 1,024 events; the server does not scan idle sockets.
+Hyper uses Tokio sockets through its native adapter while active, avoiding a
+second transport buffer and boxed completion-I/O futures for reads and flushes.
 The vendored Hyper 1.12.0 starts HTTP/1 reads at 1 KiB and allocates response
 header storage when needed. Its configured minimum and default maximum remain
 8 KiB and 417,792 bytes; request-size limits are unchanged. The upstream source
@@ -52,8 +60,9 @@ pool retains at most 128 items; byte buffers larger than 8 KiB and header maps
 with capacity above 32 are discarded. Small empty reads use a stack buffer until
 data arrives; partial requests and pending writes retain their bytes.
 Server-only builds keep header maps in these pools without reserving a header
-cache in every connection. When the last connection closes, the server releases
-the pooled objects and the vectors that hold them.
+cache in every connection. The bounded pools last for the runtime's lifetime,
+so parking the last active HTTP session does not discard reusable buffers.
+The idle connection map releases its storage after all connections drain.
 
 HTTP response bodies use immutable `Bytes`, taking ownership of serialized
 vectors without copying.
@@ -81,7 +90,7 @@ targets a 256 MiB SQLite page cache by default. Successful likes rely on SQLite'
 foreign-key checks; post existence is queried only for duplicates and foreign-key
 failures.
 
-Dependencies: Rust 1.99.0, Axum 0.8.9, rusqlite 0.40.2 with bundled SQLite,
+Dependencies: Rust 1.99.0, Axum 0.8.9, Mio 1.2.4, rusqlite 0.40.2 with bundled SQLite,
 jsonwebtoken 11.1.0, Divan 0.1.21, Gungraun 0.20.0, and Mold 3.0.0.
 The bundled SQLite build disables optional global page-cache memory management
 through shared Cargo configuration, including the contest build.

@@ -39,8 +39,6 @@ pub(crate) struct Conn<I, B, T> {
     io: Buffered<I, EncodedBuf<B>>,
     state: State,
     _marker: PhantomData<fn(T)>,
-    // Drop after io and state, which can return buffers to the shared pools.
-    _pool_guard: super::pool::ConnectionGuard,
 }
 
 impl<I, B, T> Conn<I, B, T>
@@ -89,7 +87,6 @@ where
                 allow_trailer_fields: false,
             },
             _marker: PhantomData,
-            _pool_guard: super::pool::ConnectionGuard::new(),
         }
     }
 
@@ -179,6 +176,14 @@ where
 
     pub(crate) fn is_write_closed(&self) -> bool {
         self.state.is_write_closed()
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn can_park(&self) -> bool {
+        self.state.is_idle()
+            && !self.is_mid_message()
+            && self.io.read_buf().is_empty()
+            && !self.io.has_buffered_write()
     }
 
     pub(crate) fn can_read_head(&self) -> bool {

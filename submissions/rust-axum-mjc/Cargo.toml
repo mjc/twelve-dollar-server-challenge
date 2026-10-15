@@ -13,6 +13,7 @@ futures-util = { version = "=0.3.34", default-features = false, features = ["std
 hyper = { version = "=1.12.0", features = ["http1", "server"] }
 hyper-util = { version = "=0.1.21", features = ["http1", "server-graceful", "service", "tokio"] }
 libc = "=0.2.190"
+mio = { version = "=1.2.4", default-features = false, features = ["os-poll", "os-ext"] }
 http-body-util = "=0.1.5"
 rusqlite = { version = "=0.40.2", features = ["bundled", "hooks"] }
 jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["rust_crypto"] }

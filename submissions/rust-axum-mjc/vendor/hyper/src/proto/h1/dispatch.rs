@@ -120,6 +120,31 @@ where
         })
     }
 
+    #[cfg(feature = "server")]
+    pub(crate) fn poll_until_idle(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<crate::Result<bool>> {
+        match self.poll_catch(cx, false) {
+            Poll::Ready(result) => Poll::Ready(result.map(|done| {
+                if let Dispatched::Upgrade(pending) = done {
+                    pending.manual();
+                }
+                false
+            })),
+            Poll::Pending
+                if !self.is_closing
+                    && self.conn.can_park()
+                    && self.body_tx.0.is_none()
+                    && self.body_rx.is_none()
+                    && !self.dispatch.should_poll() =>
+            {
+                Poll::Ready(Ok(true))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
     fn poll_catch(
         &mut self,
         cx: &mut Context<'_>,

@@ -53,10 +53,8 @@ retained. Active connections reuse this storage, avoiding both per-connection
 idle capacity and repeated allocation on the normal small-request path.
 Server responses return their empty header maps after encoding. Server-only
 builds omit the per-connection header-cache field; client caching is unchanged.
-A zero-sized connection guard releases the current thread's pooled objects and
-pool vectors when the last HTTP/1 connection closes. This clears all three pools
-on the application's single-thread runtime; other threads' bounded pools remain
-available on runtimes with multiple threads.
+Pools retain their bounded storage for the runtime's lifetime. They are not
+cleared when the last active HTTP session parks its still-open TCP socket.
 Scalar body deques retain their existing single-buffer slot for reuse.
 Empty reads at the initial adaptive size use a 1 KiB stack buffer, then acquire
 a pooled buffer only when bytes arrive. Larger adaptive reads keep the direct
@@ -66,3 +64,11 @@ bytes, and pending writes retain their data. Tests check pool reuse and bounds, 
 partial and completed scalar writes, and cached-header cleanup on keep-alive.
 
 The local fork uses edition 2024 and the application's Rust 1.99 toolchain.
+
+`server::conn::http1::Connection::poll_until_idle` drives an active connection
+without shutting down its transport. It returns `true` only at a keep-alive
+boundary with no partial or pipelined input, request body, handler future,
+response body, or buffered output. `into_parts` then returns the socket and
+service so the application can drop HTTP state while retaining the TCP
+connection. A later request starts a new Hyper session with that same service.
+Closed connections return `false`; errors retain the normal error path.
