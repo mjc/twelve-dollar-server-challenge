@@ -6,8 +6,8 @@ The connection task maps completion directly onto error logging, avoiding an
 async wrapper that duplicated the stored connection future. Hyper uses Tokio sockets directly
 through its native adapter, avoiding a second transport buffer and boxed
 completion-I/O futures for reads and flushes.
-The vendored Hyper 1.12.0 starts HTTP/1 read and header buffers at 1 KiB and
-grows them as needed. Its configured minimum and default maximum remain
+The vendored Hyper 1.12.0 starts HTTP/1 reads at 1 KiB and allocates response
+header storage when needed. Its configured minimum and default maximum remain
 8 KiB and 417,792 bytes; request-size limits are unchanged. The upstream source
 and local patch are documented in [vendor/hyper/LOCAL-PATCHES.md](vendor/hyper/LOCAL-PATCHES.md).
 A bounded queue keeps database
@@ -22,10 +22,8 @@ This admission timeout does not cancel database work that has already been
 queued. Canceled jobs are skipped before their SQL starts. SQLite uses the supplied schema and indexes, WAL,
 NORMAL synchronous mode, and cached prepared statements. Responses read current transaction data; writes commit before returning success. JWT signatures are verified
 on every authenticated request.
-Within each read-only batch, identical feed reads execute and serialize once
-against the transaction snapshot. Replies share immutable `Bytes` without copying their payloads.
-The worker retains no result between batches, and the next batch reads current data.
-Read batches also retain prepared transaction-control statements. A failed
+Every request executes its own SQLite query, including feed requests in the
+same batch. Read batches retain prepared transaction-control statements. A failed
 commit rolls back before replies; if cleanup leaves a transaction open, the
 worker closes that connection.
 
@@ -37,38 +35,35 @@ fails the affected replies. Canceled requests are skipped before execution;
 canceling a response after execution does not undo its write.
 
 SQLite's automatic WAL checkpoint threshold is disabled. A dedicated worker
-attempts a PASSIVE checkpoint when sampled database, WAL, and SHM file sizes
-reach 32 GiB or write admission is closed. The first eligible sample triggers
-immediately; retries wait 30 seconds. Time alone does not trigger a checkpoint
-below the threshold. It does not force a reset or truncate. The app worker
-continues serializing
-reads and writes while the checkpoint copies pages. A reader can pin frames and
-prevent full backfill, so the WAL can grow when checkpointing cannot catch up.
-After a full backfill and when readers release their snapshots, SQLite can
-reuse the WAL file; its retained capacity is not capped. The connection uses
-`synchronous=NORMAL`. Checkpoint I/O can compete with request I/O, and writers
-may sync a reused WAL header. Read
-transactions end before responses are sent, so clients cannot pin a snapshot
-while receiving its response.
-
-A background monitor samples the combined main database, WAL, and SHM file
-sizes once per second. At 39 GiB it closes write admission while reads continue,
-leaving 1 GiB of
-operational headroom under the 40 GiB budget. Writes reopen only after the
-sampled total falls below 38 GiB and a checkpoint fully backfills. This is a
-sampled operational guard, not a hard disk quota. PASSIVE checkpointing does
-not shrink retained WAL capacity, so writes stay closed if pinned readers or
-retained files keep the total above the resume threshold; cleanup or restart
-may be needed to recover.
+checks once per second and starts a PASSIVE checkpoint only after the database
+worker has done no batch work for a full interval. It skips further checkpoints
+until more work arrives if the previous one copied all committed WAL frames.
+This moves checkpoint I/O out of sustained traffic. New requests can still
+arrive while a checkpoint is running. The WAL can grow during continuous load.
+With `journal_size_limit=0`, SQLite discards its unused tail on the first commit
+after a checkpointed WAL resets. Later writes extend the file, avoiding reads
+of cold old blocks needed for partial-page overwrites.
+Read transactions end before responses are sent, so a slow client does not
+keep a database snapshot open.
 
 Idle connections return read buffers, scalar write-header vectors, and cached
 header maps to bounded per-thread pools for reuse by active connections. Each
 pool retains at most 128 items; byte buffers larger than 8 KiB and header maps
 with capacity above 32 are discarded. Small empty reads use a stack buffer until
 data arrives; partial requests and pending writes retain their bytes.
+Server-only builds keep header maps in these pools without reserving a header
+cache in every connection. When the last connection closes, the server releases
+the pooled objects and the vectors that hold them.
 
 HTTP response bodies use immutable `Bytes`, taking ownership of serialized
-vectors without copying. Feed replies within a read batch share those bytes.
+vectors without copying.
+
+Rust allocations use jemalloc with background decay. SQLite's C allocations
+keep the system allocator.
+The vendored Tokio 1.53.2 reserves 64 KiB for its current-thread ready queue
+when the runtime starts. The queue can still grow; the initial reserve avoids
+growing it among connection allocations during load. See
+[vendor/tokio/LOCAL-PATCHES.md](vendor/tokio/LOCAL-PATCHES.md).
 
 Post text, timestamps, and authors borrow SQLite row values while serializing
 directly into response bytes. Unescaped request bodies reuse the HTTP buffer;
@@ -82,8 +77,9 @@ timestamp and ID order, then counts likes through the existing post-ID index.
 The same query handles short and sparse feeds without additional ID queries
 or a separate range path.
 The supplied schema and indexes are left unchanged. The request connection
-targets a 256 MiB SQLite page cache. Successful likes rely on SQLite's foreign-key
-checks; post existence is queried only for duplicates and foreign-key failures.
+targets a 256 MiB SQLite page cache by default. Successful likes rely on SQLite's
+foreign-key checks; post existence is queried only for duplicates and foreign-key
+failures.
 
 Dependencies: Rust 1.99.0, Axum 0.8.9, rusqlite 0.40.2 with bundled SQLite,
 jsonwebtoken 11.1.0, Divan 0.1.21, Gungraun 0.20.0, and Mold 3.0.0.
@@ -124,6 +120,12 @@ HTTP/1 vectored writes and pipeline flushing are disabled. `READ_BATCHING`
 accepts `true` or `false` and defaults to `true`.
 `SQLITE_MMAP_SIZE` sets the request connection's mmap size in bytes and defaults
 to `0`; startup reports both the requested and effective sizes.
+`SQLITE_PAGE_CACHE_KIB` sets the request connection's page-cache target in KiB
+and defaults to `262144` (256 MiB). Set it to `131072` for a 128 MiB target.
+It must be positive, fit a signed 32-bit KiB value, and cover between one and
+one billion database pages. Startup reports the selected target.
+`SQLITE_TIMINGS=true` records queue waits and timeouts, batch sizes and durations,
+slow commits, and checkpoint timing. It is disabled by default.
 
 ## Development
 
