@@ -1053,6 +1053,9 @@ impl Db {
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "wal_autocheckpoint", 0)?;
+        // Discard the old tail when SQLite safely resets a checkpointed WAL.
+        // New frames then extend the file instead of reading cold overwritten pages.
+        connection.pragma_update(None, "journal_size_limit", 0)?;
         configure_page_cache(&connection, page_cache_kib)?;
         let effective_mmap_size = configure_mmap_size(&connection, mmap_size_bytes)?;
         let checkpoint_connection = Connection::open_with_flags(
