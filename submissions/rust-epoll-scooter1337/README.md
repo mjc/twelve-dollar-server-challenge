@@ -15,7 +15,7 @@ SQLITE_PATH=/path/to/feed.db JWT_SECRET=twelve-dollar-challenge \
   HOST=0.0.0.0 PORT=8080 bash start.sh
 ```
 
-`build.sh` uses Rust 1.94, downloads SQLite with a fixed archive checksum, and builds release/native/fat-LTO with synthetic SQLite PGO. Generated `vendor/` and `target/` are ignored. Native compilation requires GCC and Linux with io_uring enabled. The measured executable used Rust 1.99/GCC 16.2 with profiling symbols/frame pointers; source identity is recorded in [evidence/provenance.json](evidence/provenance.json). A different compiler/CPU does not reproduce that executable hash.
+`build.sh` and `rust-toolchain.toml` pin Rust 1.99.1, downloads SQLite with a fixed archive checksum, and builds release/native/fat-LTO with synthetic SQLite PGO. Generated `vendor/` and `target/` are ignored. Native compilation requires GCC and Linux with io_uring enabled. The measured executable used Rust 1.99/GCC 16.2 with profiling symbols/frame pointers; source identity is recorded in [evidence/provenance.json](evidence/provenance.json). A different compiler/CPU does not reproduce that executable hash.
 
 For the measured ten-port configuration, set `PORT=3100-3109`, `SCOOTER_CQ_LIMIT=32`, `SCOOTER_REARM_AFTER_DRAIN=1`, and run `target/release/twelve-rust-poll --uring-wait-us=25`. These are benchmark settings, not changes to the schema or request workload. Direct descriptor tables adapt to the inherited hard NOFILE limit; a small ordinary FD count does not remove kernel socket/file/inode memory.
 

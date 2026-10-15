@@ -7,7 +7,7 @@ if [[ -x /opt/twelve-rust/cargo/bin/cargo ]]; then
 else
   export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 fi
-export RUSTUP_TOOLCHAIN=1.94.0
+export RUSTUP_TOOLCHAIN=1.99.1
 mkdir -p vendor
 if [[ ! -f vendor/sqlite3.c ]]; then
   curl -fsSL --retry 3 https://www.sqlite.org/2026/sqlite-autoconf-3530400.tar.gz -o vendor/sqlite.tar.gz
