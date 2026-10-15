@@ -50,7 +50,7 @@ impl Default for Tuning {
     fn default() -> Self {
         Self {
             batch: 32,
-            wait_us: 250,
+            wait_us: 25,
         }
     }
 }
@@ -211,6 +211,9 @@ struct Worker {
     start: Instant,
     now: u32,
     tuning: Tuning,
+    trace_ids: std::collections::HashMap<usize, u64>,
+    trace_batch: u64,
+    trace_active: bool,
 }
 fn tag(op: u64, fd: usize, generation: u32) -> u64 {
     op | ((fd as u64) << 8) | ((generation as u64) << 32)
@@ -265,6 +268,9 @@ impl Worker {
             start: Instant::now(),
             now: 0,
             tuning,
+            trace_ids: std::collections::HashMap::new(),
+            trace_batch: 0,
+            trace_active: false,
         };
         if w.buf_ring.is_some() {
             for bid in 0..NBUFS {
@@ -349,6 +355,10 @@ impl Worker {
         self.clients[fd].state = (self.clients[fd].state | RECEIVING) & !REARM;
     }
     fn send(&mut self, fd: usize) {
+        if let Some(&id) = self.trace_ids.get(&fd) {
+            self.trace_active = true;
+            crate::latency_trace::event(id, 5, self.trace_batch, 0);
+        }
         let c = &mut self.clients[fd];
         assert!(c.sent < c.flight.len);
         let e = opcode::Send::new(
@@ -496,6 +506,7 @@ impl Worker {
         self.open -= 1;
     }
     fn process(&mut self, fd: usize, bytes: &[u8], app: &mut App) {
+        let process_ns = crate::latency_trace::now();
         let mut saved = std::mem::take(&mut self.clients[fd].input);
         if self.clients[fd].state & PAUSED != 0 {
             if saved.len as usize + bytes.len() <= INPUT_LIMIT {
@@ -528,7 +539,27 @@ impl Worker {
                 Ok(Parsed::Complete(req)) => {
                     self.clients[fd].state &= !CONTINUED;
                     self.body.clear();
+                    if req.trace_id != 0 {
+                        self.trace_active = true;
+                        self.trace_ids.insert(fd, req.trace_id);
+                        crate::latency_trace::at(
+                            process_ns,
+                            req.trace_id,
+                            1,
+                            self.trace_batch,
+                            fd as u64,
+                        );
+                        crate::latency_trace::event(req.trace_id, 2, self.trace_batch, 0);
+                    }
                     let status = app.serve(&req, &mut self.body);
+                    if req.trace_id != 0 {
+                        crate::latency_trace::event(
+                            req.trace_id,
+                            3,
+                            self.trace_batch,
+                            status as u64,
+                        );
+                    }
                     let index = self.dirty(fd);
                     self.output(fd);
                     response(status, &self.body, req.close, &mut self.clients[fd].output);
@@ -672,6 +703,10 @@ impl Worker {
         {
             return;
         }
+        if let Some(&id) = self.trace_ids.get(&fd) {
+            self.trace_active = true;
+            crate::latency_trace::event(id, 6, self.trace_batch, result as u64);
+        }
         let c = &mut self.clients[fd];
         c.state &= !SENDING;
         if result == -libc::EAGAIN || result == -libc::EINTR {
@@ -691,6 +726,7 @@ impl Worker {
             self.send(fd);
             return;
         }
+        self.trace_ids.remove(&fd);
         c.sent = 0;
         let done = std::mem::take(&mut c.flight);
         self.retire(done);
@@ -753,7 +789,18 @@ impl Worker {
     fn run(mut self, shared: Arc<Mutex<App>>) -> ! {
         let mut last_count = 0;
         let mut sweep = 0;
+        // Diagnostic only: 0 restores the original complete CQ drain.
+        let cq_limit = std::env::var("SCOOTER_CQ_LIMIT")
+            .map(|s| s.parse::<usize>().expect("SCOOTER_CQ_LIMIT"))
+            .unwrap_or(self.tuning.batch);
+        let rearm_after_drain = std::env::var("SCOOTER_REARM_AFTER_DRAIN").as_deref() == Ok("1");
+        let mut stats = [0u64; 8];
+        let mut cq_peak = 0;
+        let mut stats_second = 0;
         loop {
+            self.trace_batch += 1;
+            self.trace_active = false;
+            let loop_ns = crate::latency_trace::now();
             let timeout = if last_count >= 4 || !self.rearm.is_empty() {
                 types::Timespec::new().nsec(self.tuning.wait_us * 1000)
             } else {
@@ -779,14 +826,41 @@ impl Worker {
                     std::process::exit(1);
                 }
             }
+            let submitted_ns = crate::latency_trace::now();
             self.now = self.start.elapsed().as_secs() as u32;
+            let cq_len = self.ring.completion().len();
+            cq_peak = cq_peak.max(cq_len);
             self.completions.clear();
             self.completions.extend(
                 self.ring
                     .completion()
+                    // Bound the work before the next commit and response flush.
+                    .take(if cq_limit == 0 { usize::MAX } else { cq_limit })
                     .map(|c| (c.user_data(), c.result(), c.flags())),
             );
             last_count = self.completions.len();
+            stats[0] += 1;
+            stats[1] += last_count as u64;
+            for &(tag, result, flags) in &self.completions {
+                match tag & 255 {
+                    ACCEPT if result >= 0 => stats[2] += 1,
+                    RECV if result > 0 => stats[3] += 1,
+                    RECV if result == -libc::ENOBUFS => stats[4] += 1,
+                    RECV => stats[5] += 1,
+                    SEND => stats[6] += 1,
+                    _ => {},
+                }
+                stats[7] += u64::from(cqueue::buffer_select(flags).is_some());
+            }
+            if self.now > stats_second {
+                stats_second = self.now;
+                eprintln!("RING_STATS ns={} second={} open={} cq={} cq_peak={} rearm={} ready={} sq={} loops={} cqes={} accepts={} recv_ok={} enobufs={} recv_other={} sends={} selected={}",
+                    crate::latency_trace::now(), self.now, self.open, cq_len, cq_peak,
+                    self.rearm.len(), self.ready.len(), self.ring.submission().len(),
+                    stats[0], stats[1], stats[2], stats[3], stats[4], stats[5], stats[6], stats[7]);
+                cq_peak = 0;
+            }
+            let collected_ns = crate::latency_trace::now();
             let mut app = shared.lock().unwrap();
             let ready = self.ready.len().min(128);
             for _ in 0..ready {
@@ -811,10 +885,28 @@ impl Worker {
                 }
             }
             self.publish_buffers();
+            let commit_begin = crate::latency_trace::now();
             let committed = app.db.commit();
+            let commit_end = crate::latency_trace::now();
             self.flush(committed);
+            let flushed_ns = crate::latency_trace::now();
+            if self.trace_active {
+                for (kind, ns) in [
+                    (10, loop_ns),
+                    (11, submitted_ns),
+                    (12, collected_ns),
+                    (13, commit_begin),
+                    (14, commit_end),
+                    (15, flushed_ns),
+                ] {
+                    crate::latency_trace::at(ns, 0, kind, self.trace_batch, last_count as u64);
+                }
+            }
+            crate::latency_trace::maybe_dump();
             drop(app);
-            if !self.rearm.is_empty() {
+            if !self.rearm.is_empty()
+                && (!rearm_after_drain || self.ring.completion().is_empty())
+            {
                 let returned = self
                     .completions
                     .iter()

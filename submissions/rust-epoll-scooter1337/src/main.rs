@@ -1,4 +1,5 @@
 mod db;
+mod latency_trace;
 mod net;
 mod uring;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -258,6 +259,7 @@ pub struct Frame<'a> {
     path: &'a str,
     authorization: Option<&'a str>,
     body: Cow<'a, [u8]>,
+    pub trace_id: u64,
     pub consumed: usize,
     pub close: bool,
 }
@@ -281,12 +283,18 @@ pub fn frame(input: &[u8]) -> Result<Parsed<'_>, ()> {
         httparse::Status::Complete(n) => n,
     };
     let mut authorization = None;
+    let mut trace_id = 0;
     let mut length = None;
     let mut chunked = false;
     let mut expect_continue = false;
     let mut close = req.version != Some(1);
     for h in req.headers.iter() {
-        if h.name.eq_ignore_ascii_case("authorization") {
+        if h.name.eq_ignore_ascii_case("x-bench-trace") {
+            trace_id = std::str::from_utf8(h.value)
+                .ok()
+                .and_then(|x| u64::from_str_radix(x, 16).ok())
+                .unwrap_or(0);
+        } else if h.name.eq_ignore_ascii_case("authorization") {
             if authorization.is_some() {
                 return Err(());
             }
@@ -340,6 +348,7 @@ pub fn frame(input: &[u8]) -> Result<Parsed<'_>, ()> {
         path: req.path.ok_or(())?,
         authorization,
         body,
+        trace_id,
         consumed,
         close,
     }))
@@ -449,6 +458,7 @@ impl App {
     }
 }
 fn main() {
+    latency_trace::init();
     let mut options = net::Options::default();
     let mut epoll = false;
     let mut tuning = uring::Tuning::default();

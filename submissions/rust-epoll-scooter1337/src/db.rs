@@ -180,7 +180,7 @@ impl Db {
         }
         exec(
             raw,
-            "PRAGMA locking_mode=NORMAL; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA mmap_size=1073741824; PRAGMA cache_size=500; PRAGMA temp_store=MEMORY; PRAGMA journal_size_limit=67108864; PRAGMA wal_autocheckpoint=0; SELECT count(*) FROM sqlite_schema;",
+            "PRAGMA locking_mode=NORMAL; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA mmap_size=1073741824; PRAGMA cache_size=-262144; PRAGMA temp_store=MEMORY; PRAGMA journal_size_limit=-1; PRAGMA wal_autocheckpoint=0; SELECT count(*) FROM sqlite_schema;",
         );
         fn prepare(raw: *mut Connection, sql: &str) -> Stmt {
             let sql = CString::new(sql).unwrap();
