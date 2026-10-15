@@ -13,7 +13,15 @@ case "$(uname -m)" in
   aarch64) target=aarch64-unknown-linux-gnu ;;
   *) echo 'unsupported architecture' >&2; exit 1 ;;
 esac
-archive="rust-stable-$target.tar.xz"
+curl --fail --location --retry 3 -o channel-rust-stable.toml \
+  https://static.rust-lang.org/dist/channel-rust-stable.toml
+rust_version="$(awk -F '"' '
+  /^\[pkg.rust\]$/ { rust = 1; next }
+  /^\[/ { rust = 0 }
+  rust && /^version = / { split($2, version, " "); print version[1]; exit }
+' channel-rust-stable.toml)"
+[[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'invalid stable Rust manifest' >&2; exit 1; }
+archive="rust-$rust_version-$target.tar.xz"
 curl --fail --location --retry 3 -o "$archive" "https://static.rust-lang.org/dist/$archive"
 curl --fail --location --retry 3 -o "$archive.sha256" "https://static.rust-lang.org/dist/$archive.sha256"
 sha256sum --check "$archive.sha256"
