@@ -7,7 +7,7 @@ fn main() {
         build.flag_if_supported("-march=native");
     }
     build.file("vendor/sqlite3.c").opt_level(3)
-        .define("SQLITE_THREADSAFE", "0")
+        .define("SQLITE_THREADSAFE", "2")
         .define("SQLITE_DEFAULT_MEMSTATUS", "0")
         .define("SQLITE_DQS", "0")
         .define("SQLITE_OMIT_LOAD_EXTENSION", None)

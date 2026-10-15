@@ -1,9 +1,14 @@
 //! SQLite owns all persisted data. Calls stay under one serialized connection owner.
 use std::{
-    cell::Cell,
     ffi::{CString, c_char, c_int, c_void},
     ptr, slice,
+    sync::{
+        Arc,
+        atomic::{AtomicI32, Ordering},
+    },
 };
+
+mod checkpoint;
 
 enum Connection {}
 enum Statement {}
@@ -128,7 +133,8 @@ pub struct Db {
     commit_stmt: Stmt,
     rollback_stmt: Stmt,
     raw: *mut Connection,
-    wal_frames: Box<Cell<i32>>,
+    wal_frames: Arc<AtomicI32>,
+    checkpointer: Option<checkpoint::Checkpointer>,
     pub transaction: bool,
     pub group: bool,
 }
@@ -138,9 +144,10 @@ unsafe extern "C" fn wal_hook(
     _: *const c_char,
     frames: i32,
 ) -> i32 {
-    // Box allocation has a stable address and outlives the connection/hook.
+    // SAFETY: the Arc allocation stays alive until the connection/hook is closed.
+    // Only this connection writes; the checkpointer reads the count atomically.
     unsafe {
-        (*data.cast::<Cell<i32>>()).set(frames);
+        (*data.cast::<AtomicI32>()).store(frames, Ordering::Relaxed);
     }
     0
 }
@@ -173,7 +180,7 @@ impl Db {
         }
         exec(
             raw,
-            "PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA mmap_size=1073741824; PRAGMA cache_size=500; PRAGMA temp_store=MEMORY; PRAGMA journal_size_limit=67108864; PRAGMA wal_autocheckpoint=0; SELECT count(*) FROM sqlite_schema;",
+            "PRAGMA locking_mode=NORMAL; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA mmap_size=1073741824; PRAGMA cache_size=500; PRAGMA temp_store=MEMORY; PRAGMA journal_size_limit=67108864; PRAGMA wal_autocheckpoint=0; SELECT count(*) FROM sqlite_schema;",
         );
         fn prepare(raw: *mut Connection, sql: &str) -> Stmt {
             let sql = CString::new(sql).unwrap();
@@ -186,7 +193,7 @@ impl Db {
             Stmt(stmt)
         }
         let select = "SELECT p.id,p.body,p.created_at,u.username,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) FROM posts p JOIN users u ON u.id=p.user_id";
-        let db = Self {
+        let mut db = Self {
             feed: prepare(
                 raw,
                 &format!("{select} ORDER BY p.created_at DESC,p.id DESC LIMIT 20"),
@@ -217,7 +224,8 @@ impl Db {
             commit_stmt: prepare(raw, "COMMIT"),
             rollback_stmt: prepare(raw, "ROLLBACK"),
             raw,
-            wal_frames: Box::new(Cell::new(0)),
+            wal_frames: Arc::new(AtomicI32::new(0)),
+            checkpointer: None,
             transaction: false,
             group,
         };
@@ -225,9 +233,13 @@ impl Db {
             sqlite3_wal_hook(
                 raw,
                 Some(wal_hook),
-                (&*db.wal_frames as *const Cell<i32>).cast_mut().cast(),
+                Arc::as_ptr(&db.wal_frames).cast_mut().cast(),
             );
         }
+        db.checkpointer = Some(checkpoint::Checkpointer::start(
+            path,
+            Arc::clone(&db.wal_frames),
+        ));
         db
     }
     fn transaction_step(stmt: &mut Stmt) -> bool {
@@ -255,22 +267,6 @@ impl Db {
         }
         self.transaction = false;
         ok
-    }
-    pub fn checkpoint(&mut self) {
-        if self.wal_frames.get() >= 1000 {
-            let rc = unsafe {
-                sqlite3_wal_checkpoint_v2(
-                    self.raw,
-                    ptr::null(),
-                    2,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                )
-            };
-            if rc == 0 {
-                self.wal_frames.set(0);
-            }
-        }
     }
     pub fn read(&mut self, id: Option<i64>, out: &mut Vec<u8>) -> u16 {
         // Read and write requests share the completion batch's deferred transaction.
@@ -491,6 +487,8 @@ impl Db {
 impl Drop for Db {
     fn drop(&mut self) {
         self.commit();
+        // Stop and join before closing the request connection.
+        drop(self.checkpointer.take());
         // Finalize before closing. Fields drop afterwards; sqlite3_finalize(NULL)
         // is safe, so null each pointer to prevent a second finalization.
         for s in [

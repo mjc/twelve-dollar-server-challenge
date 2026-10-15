@@ -392,7 +392,8 @@ struct App {
 }
 // This binary owns one SQLite connection. The io_uring workers hold the same
 // Mutex<App> for the entire query/commit batch, so SQLite and Auth are never
-// entered concurrently. Moving ownership between issuers preserves NOMUTEX.
+// entered concurrently on the request connection. The background checkpointer
+// owns a different connection; SQLite is built in multi-thread mode.
 unsafe impl Send for App {}
 impl App {
     fn serve(&mut self, frame: &Frame<'_>, out: &mut Vec<u8>) -> u16 {

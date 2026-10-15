@@ -185,6 +185,11 @@ struct Pending {
     count: u32,
     interim: bool,
 }
+struct Listener {
+    fd: i32,
+    accepting: bool,
+    generation: u32,
+}
 struct Worker {
     // Destroy the ring before any of the allocations referenced by its entries.
     ring: IoUring,
@@ -196,9 +201,7 @@ struct Worker {
     clients: Vec<Client>,
     slots: usize,
     reserve: usize,
-    listener: i32,
-    accepting: bool,
-    accept_generation: u32,
+    listeners: Vec<Listener>,
     open: usize,
     ready: VecDeque<(usize, u32)>,
     completions: Vec<(u64, i32, u32)>,
@@ -213,7 +216,7 @@ fn tag(op: u64, fd: usize, generation: u32) -> u64 {
     op | ((fd as u64) << 8) | ((generation as u64) << 32)
 }
 impl Worker {
-    fn new(listener: i32, slots: usize, tuning: Tuning) -> io::Result<Self> {
+    fn new(listeners: Vec<i32>, slots: usize, tuning: Tuning) -> io::Result<Self> {
         let ring = IoUring::builder()
             .setup_cqsize(16384)
             .setup_coop_taskrun()
@@ -245,9 +248,14 @@ impl Worker {
             clients: Vec::new(),
             slots,
             reserve: 1024.min(slots / 8),
-            listener,
-            accepting: false,
-            accept_generation: 0,
+            listeners: listeners
+                .into_iter()
+                .map(|fd| Listener {
+                    fd,
+                    accepting: false,
+                    generation: 0,
+                })
+                .collect(),
             open: 0,
             ready: VecDeque::new(),
             completions: Vec::with_capacity(16384),
@@ -305,22 +313,33 @@ impl Worker {
         }
     }
     fn accept(&mut self) {
-        self.accept_generation = self.accept_generation.wrapping_add(1);
-        let e = opcode::AcceptMulti::new(types::Fd(self.listener))
-            .allocate_file_index(true)
-            .build()
-            .user_data(tag(ACCEPT, 0, self.accept_generation));
-        self.queue(e);
-        self.accepting = true;
+        for index in 0..self.listeners.len() {
+            let listener = &mut self.listeners[index];
+            if listener.accepting {
+                continue;
+            }
+            listener.generation = listener.generation.wrapping_add(1);
+            let e = opcode::AcceptMulti::new(types::Fd(listener.fd))
+                .allocate_file_index(true)
+                .build()
+                .user_data(tag(ACCEPT, index, listener.generation));
+            listener.accepting = true;
+            self.queue(e);
+        }
     }
     fn stop_accept(&mut self) {
-        self.queue(
-            opcode::AsyncCancel::new(tag(ACCEPT, 0, self.accept_generation))
+        for index in 0..self.listeners.len() {
+            let listener = &mut self.listeners[index];
+            if !listener.accepting {
+                continue;
+            }
+            let e = opcode::AsyncCancel::new(tag(ACCEPT, index, listener.generation))
                 .build()
                 .user_data(IGNORE)
-                .flags(squeue::Flags::SKIP_SUCCESS),
-        );
-        self.accepting = false;
+                .flags(squeue::Flags::SKIP_SUCCESS);
+            listener.accepting = false;
+            self.queue(e);
+        }
     }
     fn recv(&mut self, fd: usize) {
         let e = opcode::RecvMulti::new(types::Fixed(fd as u32), GROUP)
@@ -569,9 +588,10 @@ impl Worker {
             self.schedule(fd);
         }
     }
-    fn on_accept(&mut self, generation: u32, result: i32, flags: u32) {
-        if !cqueue::more(flags) && generation == self.accept_generation {
-            self.accepting = false;
+    fn on_accept(&mut self, index: usize, generation: u32, result: i32, flags: u32) {
+        let listener = &mut self.listeners[index];
+        if !cqueue::more(flags) && generation == listener.generation {
+            listener.accepting = false;
         }
         if result < 0 {
             return;
@@ -594,7 +614,7 @@ impl Worker {
         };
         self.open += 1;
         self.recv(fd);
-        if self.accepting && self.slots - self.open < self.reserve {
+        if self.slots - self.open < self.reserve {
             self.stop_accept();
         }
     }
@@ -784,7 +804,7 @@ impl Worker {
                 let fd = ((tag >> 8) & 0xffffff) as usize;
                 let generation = (tag >> 32) as u32;
                 match tag & 255 {
-                    ACCEPT => self.on_accept(generation, result, flags),
+                    ACCEPT => self.on_accept(fd, generation, result, flags),
                     RECV => self.on_recv(fd, generation, result, flags, &mut app),
                     SEND => self.on_send(fd, generation, result),
                     _ => {}
@@ -793,7 +813,6 @@ impl Worker {
             self.publish_buffers();
             let committed = app.db.commit();
             self.flush(committed);
-            app.db.checkpoint();
             drop(app);
             if !self.rearm.is_empty() {
                 let returned = self
@@ -818,7 +837,7 @@ impl Worker {
                     }
                 }
             }
-            if !self.accepting && self.slots - self.open >= self.reserve * 2 {
+            if self.slots - self.open >= self.reserve * 2 {
                 self.accept();
             }
             if self.now >= sweep + 10 {
@@ -868,6 +887,58 @@ fn response(status: u16, body: &[u8], close: bool, out: &mut Buffer) {
     });
     out.extend(body);
 }
+fn listen_addresses(address: &str) -> io::Result<Vec<String>> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid TCP port range");
+    let (host, ports) = address.rsplit_once(':').ok_or_else(invalid)?;
+    let Some((first, last)) = ports.split_once('-') else {
+        return Ok(vec![address.to_owned()]);
+    };
+    let first = first.parse::<u16>().map_err(|_| invalid())?;
+    let last = last.parse::<u16>().map_err(|_| invalid())?;
+    if first == 0 || first > last {
+        return Err(invalid());
+    }
+    Ok((first..=last)
+        .map(|port| format!("{host}:{port}"))
+        .collect())
+}
+
+#[cfg(test)]
+mod multiport_tests {
+    use super::listen_addresses;
+
+    #[test]
+    fn expands_ports_and_preserves_single_listener() {
+        assert_eq!(
+            listen_addresses("127.0.0.1:3001").unwrap(),
+            ["127.0.0.1:3001"]
+        );
+        assert_eq!(
+            listen_addresses("0.0.0.0:3100-3109").unwrap(),
+            (3100..=3109)
+                .map(|port| format!("0.0.0.0:{port}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            listen_addresses("[::1]:65535-65535").unwrap(),
+            ["[::1]:65535"]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_ranges() {
+        for address in [
+            "127.0.0.1:3109-3100",
+            "127.0.0.1:0-1",
+            "127.0.0.1:1-65536",
+            "127.0.0.1:1-",
+            "127.0.0.1:1-2-3",
+        ] {
+            assert!(listen_addresses(address).is_err(), "{address}");
+        }
+    }
+}
+
 pub fn run(address: &str, app: App, tuning: Tuning) -> io::Result<()> {
     let mut limits = libc::rlimit {
         rlim_cur: 0,
@@ -893,41 +964,48 @@ pub fn run(address: &str, app: App, tuning: Tuning) -> io::Result<()> {
     // accept's listener reference. Retry only address-in-use, well within the
     // challenge's 60-second startup allowance.
     let mut attempt = 0;
-    let listener = loop {
-        match TcpListener::bind(address) {
-            Ok(listener) => break listener,
-            Err(e) if e.raw_os_error() == Some(libc::EADDRINUSE) && attempt < 200 => {
-                attempt += 1;
-                std::thread::sleep(Duration::from_millis(50));
+    let mut listeners = Vec::new();
+    for address in listen_addresses(address)? {
+        let listener = loop {
+            match TcpListener::bind(&address) {
+                Ok(listener) => break listener,
+                Err(e) if e.raw_os_error() == Some(libc::EADDRINUSE) && attempt < 200 => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
+        };
+        let fd = listener.as_raw_fd();
+        let enabled = 1i32;
+        // SAFETY: listener owns this live socket; enabled is a readable i32 for
+        // the duration of setsockopt. All listeners outlive the worker threads.
+        unsafe {
+            if libc::listen(fd, 4096) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                (&enabled as *const i32).cast(),
+                std::mem::size_of_val(&enabled) as libc::socklen_t,
+            ) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
         }
-    };
-    let fd = listener.as_raw_fd();
-    let enabled = 1i32;
-    unsafe {
-        if libc::listen(fd, 4096) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_NODELAY,
-            (&enabled as *const i32).cast(),
-            4,
-        ) != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+        listeners.push(listener);
     }
     let shared = Arc::new(Mutex::new(app));
     for id in 0..workers {
         let app = Arc::clone(&shared);
+        let fds = listeners.iter().map(AsRawFd::as_raw_fd).collect();
         let (tx, rx) = mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name(format!("ring-{id}"))
             .stack_size(1024 * 1024)
-            .spawn(move || match Worker::new(fd, slots, tuning) {
+            .spawn(move || match Worker::new(fds, slots, tuning) {
                 Ok(mut w) => {
                     w.accept();
                     match w.ring.submit() {

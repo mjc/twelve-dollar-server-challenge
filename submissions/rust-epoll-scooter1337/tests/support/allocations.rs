@@ -77,7 +77,6 @@ mod allocation_check {
                 out.clear();
                 assert!(app.serve(&req, &mut out) < 300);
                 assert!(app.db.commit());
-                app.db.checkpoint();
             }
             ACTIVE.with(|n| n.set(false));
             let count = COUNT.with(Cell::get);

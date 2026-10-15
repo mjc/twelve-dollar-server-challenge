@@ -421,7 +421,6 @@ pub fn run(address: &str, mut app: App, options: Options) -> io::Result<()> {
                 Err(()) => close(ep, p.fd, &mut clients),
             }
         }
-        app.db.checkpoint();
         if now >= last_sweep + 10 {
             for fd in 0..clients.len() {
                 if clients[fd].live && now.saturating_sub(clients[fd].touched) >= 120 {
