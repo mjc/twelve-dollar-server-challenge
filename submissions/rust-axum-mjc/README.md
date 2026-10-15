@@ -178,3 +178,21 @@ For CPU or heap profiling, `cargo build --locked --profile profiling --jobs 1`
 retains full DWARF symbols with the release optimization settings. Rust and
 bundled SQLite preserve frame pointers. Run perf, heaptrack, or Pyroclast against
 that executable; deployment and recording scripts live in the shared devshell.
+
+### Capacity measurements
+
+The same optimized binary, ten listeners, and 256 MiB SQLite cache produced:
+
+| Connections | Hold requests/s | p95 / p99 | Errors | Peak server RSS | Hold CPU, one core = 100% |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 400,000 | 42,195 | 5.50 / 25.77 ms | 0 | 244.22 MiB | 96.14% |
+| 450,000 | 47,509 | 4.71 / 50.13 ms | 0 | 329.65 MiB | 106.86% |
+
+Both runs completed ramp, hold, and drain without errors or OOM. Each used a
+60-second nominal user hold; initial user think time left about 54 and 51
+seconds sampled at the full TCP count. CPU, memory, and I/O profilers were on.
+The application cgroup limit was 2,147,483,648 bytes, including kernel memory,
+socket buffers, and file cache. These measurements do not establish the
+five-minute, whole-system 2 GB / one-vCPU contest result. In particular, the
+450,000-connection run used more than one core while profiled, and enforcement
+of the configured CPU quota was not verified.
