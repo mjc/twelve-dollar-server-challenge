@@ -19,6 +19,7 @@ jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["rus
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.151", features = ["raw_value"] }
 tokio = { version = "=1.53.2", features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+tikv-jemallocator = { version = "=0.7.0", features = ["background_threads"] }
 tower = { version = "=0.5.3", features = ["make", "util"] }
 
 [patch.crates-io]
