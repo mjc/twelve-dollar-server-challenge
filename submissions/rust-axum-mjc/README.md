@@ -82,17 +82,24 @@ when the runtime starts. The queue can still grow; the initial reserve avoids
 growing it among connection allocations during load. See
 [vendor/tokio/LOCAL-PATCHES.md](vendor/tokio/LOCAL-PATCHES.md).
 
-Post text, timestamps, and authors borrow SQLite row values while serializing
-directly into response bytes. Unescaped request bodies reuse the HTTP buffer;
+Post text, timestamps, and authors borrow SQLite row values while serializing.
+Single-post and fallback feed queries write directly into response bytes.
+Unescaped request bodies reuse the HTTP buffer;
 escaped bodies reuse their decoded allocation. No post or token cache is used.
 Fixed JSON keys are appended as static bytes; serde_json encodes the values.
 The dispatcher keeps Hyper's concrete request body for routes that do not read
 it. Only post creation wraps the body for Axum's byte extractor and size limit.
 Response allocation sizes reuse the observed capacity for each query type.
-One prepared feed query selects the latest 20 posts with valid authors in
-timestamp and ID order, then counts likes through the existing post-ID index.
-The same query handles short and sparse feeds without additional ID queries
-or a separate range path.
+Each feed request discovers the latest 20 post IDs in timestamp and ID order.
+When their checked ID span is below 256, prepared range queries count likes in
+SQLite and read joined posts through the existing indexes. The response restores
+the selected ID order. Sparse spans, arithmetic overflow, and missing author
+joins use the original feed query, whose limit follows the join. All queries use
+the request's current transaction; no result survives between requests.
+The range path serializes into worker scratch storage, then copies those bytes
+into the response. Scratch contents are cleared on success, fallback, and error;
+at most 64 KiB of capacity is retained. The extra byte copy and retained scratch
+are unmeasured CPU and memory tradeoffs against the original query.
 The supplied schema and indexes are left unchanged. The request connection
 targets a 32 MiB SQLite page cache by default. Successful likes rely on SQLite's
 foreign-key checks; post existence is queried only for duplicates and foreign-key
