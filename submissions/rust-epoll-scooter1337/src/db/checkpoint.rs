@@ -7,7 +7,7 @@ pub(super) struct Checkpointer {
 }
 
 // Each connection stays on one thread. SQLITE_THREADSAFE=2 protects SQLite's
-// shared state; NORMAL locking permits this connection to backfill the WAL.
+// shared state; unix-excl coordinates in-process readers and the checkpointer.
 struct CheckpointConnection(*mut Connection);
 impl Drop for CheckpointConnection {
     fn drop(&mut self) {
@@ -42,7 +42,7 @@ impl Checkpointer {
                 let mut raw = ptr::null_mut();
                 // SAFETY: the path and output pointer are valid for this call.
                 // This connection is created, used and closed on this thread.
-                assert_eq!(unsafe { sqlite3_open_v2(path.as_ptr(), &mut raw, 2 | 0x8000, ptr::null()) }, 0);
+                assert_eq!(unsafe { sqlite3_open_v2(path.as_ptr(), &mut raw, 2 | 0x8000, CONNECTION_VFS) }, 0);
                 let connection = CheckpointConnection(raw);
                 let sql = c"PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=0; PRAGMA cache_size=500; SELECT count(*) FROM sqlite_schema;";
                 // SAFETY: connection and SQL are live, and callbacks are disabled.
@@ -104,7 +104,7 @@ mod tests {
         let mut raw = ptr::null_mut();
         // SAFETY: valid input/output pointers; the test owns the new connection.
         assert_eq!(
-            unsafe { sqlite3_open_v2(path.as_ptr(), &mut raw, 6 | 0x8000, ptr::null()) },
+            unsafe { sqlite3_open_v2(path.as_ptr(), &mut raw, 6 | 0x8000, CONNECTION_VFS) },
             0
         );
         CheckpointConnection(raw)
@@ -170,6 +170,10 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(db.create(1, "alice", "before snapshot", &mut out), 201);
         assert!(db.commit());
+        assert!(
+            !fixture.with_extension("db-shm").exists(),
+            "the process-local WAL index must not create a shared-memory file"
+        );
         let reader = open(&path);
         exec(&reader, c"BEGIN; SELECT * FROM posts;");
         for _ in 0..500 {

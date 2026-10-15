@@ -40,3 +40,11 @@ Scooter already uses native CPU, opt3/fat LTO/one codegen unit/panic-abort and d
 Copy only Axum's fixed-deadline mixed FIFO collection: 1024 maximum or 1 ms from first dequeued job, whichever comes first. Keep per-request SQL, cache256/mmap0, checkpoint/WAL policy, admission, transaction-error policy, ports, parser, allocator and seed unchanged. Hold replies through COMMIT. The 1 ms bounds collection, not execution/COMMIT. Larger groups may retain more completed bodies and burst sends.
 
 Record batch-size histogram, collection/execution/COMMIT totals, retained reply capacities, pending/CQ/input ownership, WAL bytes/dirty waits and CPU/request in the same 475k window. Added totals/histogram are cumulative; old queue/COMMIT maxima reset per reporting interval. `response_bytes_max` means summed Vec capacities, not serialized lengths. `execution_us` includes mutex acquisition. A lower commit count is not proof of eliminating per-query work or storage stalls.
+
+## Later Axum changes
+
+The October 15 follow-up ports `5c93f21` and `1ae2cc4`: both SQLite connections select the Unix `unix-excl` VFS, and the installer, build script and toolchain file pin Rust 1.99.1. The WAL index lives in SQLite-owned heap memory instead of a `-shm` mapping. The database and WAL remain on disk with WAL/NORMAL and commit-gated replies. The process holds the database lock against other SQLite processes while open. This changes the index's backing storage; no Scooter capacity, CPU, latency or memory improvement is claimed without a new measurement.
+
+Axum's `2981d41` retains empty completion arrays and scans only the current batch prefix. Scooter already allocates its reply Vec once outside the SQL worker loop and drains only its populated entries after COMMIT. It has no 1024-element empty completion-array scan to remove. Axum's `e02dc73` soft-NOFILE change is already represented by Scooter `10bd296`; the removed benchmark wrapper and output-example wording are absent here.
+
+The checkpoint regression also checks that no `-shm` file appears, while exercising an in-process snapshot reader, background checkpoint catch-up and committed-data persistence after reopening. In-process test readers use the same VFS as the two production connections. This does not establish that writeback stalls or admission errors are eliminated.

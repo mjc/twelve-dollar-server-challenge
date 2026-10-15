@@ -10,6 +10,13 @@ use std::{
 
 mod checkpoint;
 
+// Both connections belong to this process. unix-excl retains the WAL index in
+// heap memory and holds the database lock against other SQLite processes.
+#[cfg(unix)]
+const CONNECTION_VFS: *const c_char = c"unix-excl".as_ptr();
+#[cfg(not(unix))]
+const CONNECTION_VFS: *const c_char = ptr::null();
+
 enum Connection {}
 enum Statement {}
 unsafe extern "C" {
@@ -172,7 +179,9 @@ impl Db {
         let path = CString::new(path).expect("SQLITE_PATH contains NUL");
         let mut raw = ptr::null_mut();
         assert_eq!(
-            unsafe { sqlite3_open_v2(path.as_ptr(), &mut raw, 2 | 0x8000, ptr::null()) },
+            // SAFETY: terminated path/VFS strings and a valid output pointer.
+            // The new connection remains under one serialized owner.
+            unsafe { sqlite3_open_v2(path.as_ptr(), &mut raw, 2 | 0x8000, CONNECTION_VFS) },
             0,
             "open SQLite"
         );
