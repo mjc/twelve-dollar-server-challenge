@@ -1,0 +1,1047 @@
+{
+  "result": "475k same-build/settings CPU-profile PASS; one run only, server/all5recorders stopped",
+  "binary_sha256": "77412ab79a14ee3a03b9d4d50173f58397e1be5bcb986caca278daa9a0dcfb2d",
+  "source_provenance": "Exact frozen passing77412ab7 source manifest, derived from Scooter1337 codex/rust-io-uring-v2 at63eeda6; source-only history reconstruction does not change profiled code.",
+  "settings": "header24/cache256/mmap0/SQLworker/CQ32/retry1/wait25/inputfloor256/idlePASSIVE/freshseed,60s ramp/75s nominalhold/30s drain/10s grace; usual5recorders including99Hz CPUclockFP/kernel stacks",
+  "aggregate": {
+    "avg_ms": 3.6976241454936205,
+    "checks_failed": 0,
+    "errors": {
+      "counts": {},
+      "examples": [],
+      "omitted": 0
+    },
+    "failed": 0,
+    "failure_rate": 0.0,
+    "max_ms": 597.328808,
+    "med_ms": 0.504052,
+    "p95_ms": 1.0533599999999999,
+    "p99_ms": 12.593201280000034,
+    "requests": 6429972
+  },
+  "hold": {
+    "memory_scope": "sampled cgroup memory.current, including descendants, socket buffers and page cache",
+    "requests_per_second": 50217.40292136738,
+    "sample_duration_s": 73.241918173,
+    "sample_finished_at": "2026-10-15T16:50:25.744205282+00:00",
+    "sample_started_at": "2026-10-15T16:49:12.502287109+00:00",
+    "sampled_peak_memory_bytes": 2147479552,
+    "service_cpu_percent": 59.5851024776792
+  },
+  "connections": {
+    "attempts": 475000,
+    "established": 475000,
+    "failed": 0,
+    "cancelled": 0
+  },
+  "window": {
+    "first_full_TCP_UTC": "2026-10-15T16:49:18.468741607+00:00",
+    "last_full_TCP_UTC": "2026-10-15T16:50:25.082446886+00:00",
+    "duration_s": 66.61370515823364,
+    "sample_rows": 35,
+    "completed_request_counter_delta": 3342119,
+    "perf_monotonic_lo": 242237.72899651527,
+    "perf_monotonic_hi": 242304.3427016735,
+    "scope": "Longest contiguous generator-sampled fullTCP segment; clock translation uses target UTC-minus-monotonic metadata."
+  },
+  "samples": 4088,
+  "lost_perf_samples": 0,
+  "sampled_CPU_s": 41.29292888,
+  "sampled_CPU_us_per_completed_request_approx": 12.355313763513509,
+  "actual_cgroup_CPU_counter_deltas_usec": {
+    "usage_usec": 39496135,
+    "user_usec": 18778651,
+    "system_usec": 20717484
+  },
+  "counter_window_s": 66.07553124427795,
+  "counter_CPU_us_per_completed_request_approx": 11.817692607594164,
+  "thread_mode_samples": [
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "sampled_cpu_percent": 48.60567514677104,
+      "sampled_cpu_s": 20.07070687
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "sampled_cpu_percent": 37.548923679060664,
+      "sampled_cpu_s": 15.50505035
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "kernel",
+      "sampled_cpu_percent": 9.197651663405088,
+      "sampled_cpu_s": 3.79797976
+    },
+    {
+      "thread": "ring-0",
+      "mode": "user",
+      "sampled_cpu_percent": 4.647749510763209,
+      "sampled_cpu_s": 1.9191919
+    }
+  ],
+  "thread_CPU_counter_deltas_ticks": [
+    {
+      "tid": 2153628,
+      "name": "twelve-rust-pol",
+      "user_ticks": 0,
+      "system_ticks": 0,
+      "counter_CPU_share_percent": 0.0
+    },
+    {
+      "tid": 2153630,
+      "name": "sqlite-checkpoi",
+      "user_ticks": 0,
+      "system_ticks": 0,
+      "counter_CPU_share_percent": 0.0
+    },
+    {
+      "tid": 2153631,
+      "name": "sqlite-requests",
+      "user_ticks": 1803,
+      "system_ticks": 480,
+      "counter_CPU_share_percent": 57.79746835443038
+    },
+    {
+      "tid": 2153632,
+      "name": "ring-0",
+      "user_ticks": 205,
+      "system_ticks": 1462,
+      "counter_CPU_share_percent": 42.20253164556962
+    },
+    {
+      "tid": 2153633,
+      "name": "iou-wrk-2153632",
+      "user_ticks": 0,
+      "system_ticks": 0,
+      "counter_CPU_share_percent": 0.0
+    }
+  ],
+  "counter_user_system_share_percent": {
+    "user": 47.54554084849062,
+    "system": 52.45445915150938
+  },
+  "inclusive_callers": [
+    {
+      "thread": "sqlite-requests",
+      "symbol": "sqlite3_step",
+      "sampled_cpu_percent": 43.7133072407045,
+      "sampled_cpu_s": 18.05050487
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "sqlite3VdbeExec",
+      "sampled_cpu_percent": 42.465753424657535,
+      "sampled_cpu_s": 17.53535336
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "<twelve_rust_poll::db::Db>::read",
+      "sampled_cpu_percent": 37.08414872798434,
+      "sampled_cpu_s": 15.31313116
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "__do_sys_io_uring_enter",
+      "sampled_cpu_percent": 36.47260273972603,
+      "sampled_cpu_s": 15.06060591
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "<twelve_rust_poll::db::Db>::range_feed",
+      "sampled_cpu_percent": 30.18590998043053,
+      "sampled_cpu_s": 12.46464634
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "tcp_sendmsg",
+      "sampled_cpu_percent": 24.951076320939332,
+      "sampled_cpu_s": 10.3030302
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "tcp_sendmsg_locked",
+      "sampled_cpu_percent": 24.70645792563601,
+      "sampled_cpu_s": 10.2020201
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "<twelve_rust_poll::db::Stmt>::reset",
+      "sampled_cpu_percent": 15.557729941291583,
+      "sampled_cpu_s": 6.42424236
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "<twelve_rust_poll::db::Db>::transaction_step",
+      "sampled_cpu_percent": 9.735812133072406,
+      "sampled_cpu_s": 4.02020198
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "<twelve_rust_poll::db::Db>::commit",
+      "sampled_cpu_percent": 9.637964774951076,
+      "sampled_cpu_s": 3.97979794
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "<twelve_rust_poll::db::Db>::like",
+      "sampled_cpu_percent": 5.1614481409001955,
+      "sampled_cpu_s": 2.13131311
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "<twelve_rust_poll::uring::Worker>::run",
+      "sampled_cpu_percent": 5.063600782778865,
+      "sampled_cpu_s": 2.09090907
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "nf_conntrack_in",
+      "sampled_cpu_percent": 4.623287671232877,
+      "sampled_cpu_s": 1.90909089
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "twelve_rust_poll::db::append_post_with_likes",
+      "sampled_cpu_percent": 4.280821917808219,
+      "sampled_cpu_s": 1.76767675
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "__nf_conntrack_find_get",
+      "sampled_cpu_percent": 3.498043052837573,
+      "sampled_cpu_s": 1.44444443
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "__memmove_avx512_unaligned_erms",
+      "sampled_cpu_percent": 3.1800391389432483,
+      "sampled_cpu_s": 1.3131313
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "<twelve_rust_poll::uring::Worker>::on_recv",
+      "sampled_cpu_percent": 3.1800391389432483,
+      "sampled_cpu_s": 1.3131313
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "<twelve_rust_poll::uring::Worker>::process",
+      "sampled_cpu_percent": 2.2260273972602738,
+      "sampled_cpu_s": 0.91919191
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "tcp_recvmsg",
+      "sampled_cpu_percent": 2.079256360078278,
+      "sampled_cpu_s": 0.85858585
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "twelve_rust_poll::json_string",
+      "sampled_cpu_percent": 2.054794520547945,
+      "sampled_cpu_s": 0.84848484
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "tcp_recvmsg_locked",
+      "sampled_cpu_percent": 1.981409001956947,
+      "sampled_cpu_s": 0.81818181
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "perf_trace_io_uring_complete",
+      "sampled_cpu_percent": 1.223091976516634,
+      "sampled_cpu_s": 0.5050505
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "<twelve_rust_poll::uring::sql::Port>::submit::<<twelve_rust_poll::uring::Worker>::process::{closure#0}>",
+      "sampled_cpu_percent": 1.1741682974559686,
+      "sampled_cpu_s": 0.48484848
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "<twelve_rust_poll::db::Stmt>::text",
+      "sampled_cpu_percent": 1.149706457925636,
+      "sampled_cpu_s": 0.47474747
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "_int_malloc",
+      "sampled_cpu_percent": 1.1007827788649707,
+      "sampled_cpu_s": 0.45454545
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "<twelve_rust_poll::uring::Worker>::sql_ready",
+      "sampled_cpu_percent": 1.0029354207436398,
+      "sampled_cpu_s": 0.41414141
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "perf_trace_io_uring_submit_req",
+      "sampled_cpu_percent": 0.8072407045009784,
+      "sampled_cpu_s": 0.33333333
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "__libc_malloc2",
+      "sampled_cpu_percent": 0.7093933463796477,
+      "sampled_cpu_s": 0.29292929
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "do_try_to_free_pages",
+      "sampled_cpu_percent": 0.7093933463796477,
+      "sampled_cpu_s": 0.29292929
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "try_to_free_mem_cgroup_pages",
+      "sampled_cpu_percent": 0.7093933463796477,
+      "sampled_cpu_s": 0.29292929
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "get_page_from_freelist",
+      "sampled_cpu_percent": 0.684931506849315,
+      "sampled_cpu_s": 0.28282828
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "kmalloc_reserve",
+      "sampled_cpu_percent": 0.684931506849315,
+      "sampled_cpu_s": 0.28282828
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "<twelve_rust_poll::uring::Worker>::process::{closure#0}",
+      "sampled_cpu_percent": 0.6604696673189824,
+      "sampled_cpu_s": 0.27272727
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "<twelve_rust_poll::db::Db>::create",
+      "sampled_cpu_percent": 0.6360078277886496,
+      "sampled_cpu_s": 0.26262626
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "nf_conntrack_tcp_packet",
+      "sampled_cpu_percent": 0.5626223091976517,
+      "sampled_cpu_s": 0.23232323
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "get_page_from_freelist",
+      "sampled_cpu_percent": 0.5136986301369862,
+      "sampled_cpu_s": 0.21212121
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "<std::sync::mpsc::Sender<twelve_rust_poll::uring::sql::Job>>::send",
+      "sampled_cpu_percent": 0.4892367906066536,
+      "sampled_cpu_s": 0.2020202
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "__libc_malloc2",
+      "sampled_cpu_percent": 0.3913894324853229,
+      "sampled_cpu_s": 0.16161616
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "_int_malloc",
+      "sampled_cpu_percent": 0.3424657534246575,
+      "sampled_cpu_s": 0.14141414
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "nf_conntrack_in",
+      "sampled_cpu_percent": 0.3180039138943248,
+      "sampled_cpu_s": 0.13131313
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "_int_free_merge_chunk",
+      "sampled_cpu_percent": 0.3180039138943248,
+      "sampled_cpu_s": 0.13131313
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "__memmove_avx512_unaligned_erms",
+      "sampled_cpu_percent": 0.29354207436399216,
+      "sampled_cpu_s": 0.12121212
+    },
+    {
+      "thread": "ring-0",
+      "symbol": "tcp_send_mss",
+      "sampled_cpu_percent": 0.29354207436399216,
+      "sampled_cpu_s": 0.12121212
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "<std::sync::mpsc::Sender<twelve_rust_poll::uring::sql::Reply>>::send",
+      "sampled_cpu_percent": 0.2690802348336595,
+      "sampled_cpu_s": 0.11111111
+    },
+    {
+      "thread": "sqlite-requests",
+      "symbol": "<std::sync::mpsc::Receiver<twelve_rust_poll::uring::sql::Job>>::try_recv",
+      "sampled_cpu_percent": 0.2690802348336595,
+      "sampled_cpu_s": 0.11111111
+    }
+  ],
+  "exclusive_leaves": [
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "sqlite3BtreeTableMoveto",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 6.311154598825832,
+      "sampled_cpu_s": 2.60606058
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "sqlite3VdbeExec",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 5.1614481409001955,
+      "sampled_cpu_s": 2.13131311
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "__mod_timer",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 3.9138943248532287,
+      "sampled_cpu_s": 1.6161616
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "__nf_conntrack_find_get",
+      "dso": "[nf_conntrack]",
+      "sampled_cpu_percent": 3.4735812133072406,
+      "sampled_cpu_s": 1.43434342
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "__memmove_avx512_unaligned_erms",
+      "dso": "/nix/store/h4wfwic161kxrr74jlzla5lsm28hgary-glibc-2.44-25/lib/libc.so.6",
+      "sampled_cpu_percent": 3.057729941291585,
+      "sampled_cpu_s": 1.26262625
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "pcache1FetchNoMutex",
+      "dso": "inlined",
+      "sampled_cpu_percent": 3.057729941291585,
+      "sampled_cpu_s": 1.26262625
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "io_issue_sqe",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 2.446183953033268,
+      "sampled_cpu_s": 1.010101
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "sqlite3GetVarint",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 2.299412915851272,
+      "sampled_cpu_s": 0.94949494
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "pcache1TruncateUnsafe",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 2.054794520547945,
+      "sampled_cpu_s": 0.84848484
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "pcache1PinPage",
+      "dso": "inlined",
+      "sampled_cpu_percent": 1.3943248532289627,
+      "sampled_cpu_s": 0.57575757
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "sqlite3BtreeIndexMoveto",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 1.296477495107632,
+      "sampled_cpu_s": 0.53535353
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "iommu_v1_map_pages",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 1.296477495107632,
+      "sampled_cpu_s": 0.53535353
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "nft_do_chain",
+      "dso": "[nf_tables]",
+      "sampled_cpu_percent": 1.2475538160469666,
+      "sampled_cpu_s": 0.51515151
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "twelve_rust_poll::json_string",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 1.223091976516634,
+      "sampled_cpu_s": 0.5050505
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "_raw_spin_unlock_irqrestore",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 1.1986301369863013,
+      "sampled_cpu_s": 0.49494949
+    },
+    {
+      "thread": "ring-0",
+      "mode": "user",
+      "symbol": "<twelve_rust_poll::uring::Worker>::on_recv",
+      "dso": "inlined",
+      "sampled_cpu_percent": 0.8806262230919765,
+      "sampled_cpu_s": 0.36363636
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "sock_from_file",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.8561643835616438,
+      "sampled_cpu_s": 0.35353535
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "_int_malloc",
+      "dso": "/nix/store/h4wfwic161kxrr74jlzla5lsm28hgary-glibc-2.44-25/lib/libc.so.6",
+      "sampled_cpu_percent": 0.831702544031311,
+      "sampled_cpu_s": 0.34343434
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "btreeParseCell",
+      "dso": "inlined",
+      "sampled_cpu_percent": 0.831702544031311,
+      "sampled_cpu_s": 0.34343434
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "tcp_rate_check_app_limited",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.831702544031311,
+      "sampled_cpu_s": 0.34343434
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "read_tsc",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.7827788649706457,
+      "sampled_cpu_s": 0.32323232
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "sqlite3BtreeNext",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 0.7338551859099804,
+      "sampled_cpu_s": 0.3030303
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "btreeParseCellPtr",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 0.7338551859099804,
+      "sampled_cpu_s": 0.3030303
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "pcache1Unpin",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 0.7338551859099804,
+      "sampled_cpu_s": 0.3030303
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "kernel",
+      "symbol": "_raw_spin_unlock_irq",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.7093933463796477,
+      "sampled_cpu_s": 0.29292929
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "getAndInitPage",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 0.7093933463796477,
+      "sampled_cpu_s": 0.29292929
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "walChecksumBytes",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 0.684931506849315,
+      "sampled_cpu_s": 0.28282828
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "getPageNormal",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 0.684931506849315,
+      "sampled_cpu_s": 0.28282828
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "_copy_from_iter",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.6360078277886496,
+      "sampled_cpu_s": 0.26262626
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "kernel",
+      "symbol": "htab_map_update_elem",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.6360078277886496,
+      "sampled_cpu_s": 0.26262626
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "__local_bh_enable_ip",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.611545988258317,
+      "sampled_cpu_s": 0.25252525
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "_copy_to_iter",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.5626223091976517,
+      "sampled_cpu_s": 0.23232323
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "columnMem",
+      "dso": "inlined",
+      "sampled_cpu_percent": 0.5626223091976517,
+      "sampled_cpu_s": 0.23232323
+    },
+    {
+      "thread": "ring-0",
+      "mode": "user",
+      "symbol": "[unknown]",
+      "dso": "[vdso]",
+      "sampled_cpu_percent": 0.5136986301369862,
+      "sampled_cpu_s": 0.21212121
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "igc_xmit_frame",
+      "dso": "[igc]",
+      "sampled_cpu_percent": 0.4892367906066536,
+      "sampled_cpu_s": 0.2020202
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "vdbeRecordCompareInt",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 0.4892367906066536,
+      "sampled_cpu_s": 0.2020202
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "__dev_queue_xmit",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.4892367906066536,
+      "sampled_cpu_s": 0.2020202
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "kernel",
+      "symbol": "_raw_spin_unlock_irqrestore",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.46477495107632094,
+      "sampled_cpu_s": 0.19191919
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "nf_conntrack_tcp_packet",
+      "dso": "[nf_conntrack]",
+      "sampled_cpu_percent": 0.46477495107632094,
+      "sampled_cpu_s": 0.19191919
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "<alloc::vec::Vec<u8>>::push_mut",
+      "dso": "inlined",
+      "sampled_cpu_percent": 0.4158512720156555,
+      "sampled_cpu_s": 0.17171717
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "io_submit_sqes",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.4158512720156555,
+      "sampled_cpu_s": 0.17171717
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "<twelve_rust_poll::db::Db>::range_feed",
+      "dso": "inlined",
+      "sampled_cpu_percent": 0.3913894324853229,
+      "sampled_cpu_s": 0.16161616
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "tcp_init_cwnd",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.3913894324853229,
+      "sampled_cpu_s": 0.16161616
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "io_poll_issue",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.3913894324853229,
+      "sampled_cpu_s": 0.16161616
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "__alloc_tagging_slab_alloc_hook",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.3913894324853229,
+      "sampled_cpu_s": 0.16161616
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "sqlite3_step",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 0.3913894324853229,
+      "sampled_cpu_s": 0.16161616
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "htab_map_hash",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.3669275929549902,
+      "sampled_cpu_s": 0.15151515
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "[unknown]",
+      "dso": "[unknown]",
+      "sampled_cpu_percent": 0.3669275929549902,
+      "sampled_cpu_s": 0.15151515
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "__siphash_unaligned",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.3669275929549902,
+      "sampled_cpu_s": 0.15151515
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "sqlite3_column_bytes",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 0.3669275929549902,
+      "sampled_cpu_s": 0.15151515
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "_raw_spin_unlock_irq",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.3669275929549902,
+      "sampled_cpu_s": 0.15151515
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "sock_sendmsg",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.3424657534246575,
+      "sampled_cpu_s": 0.14141414
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "sqlite3PcacheRelease",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 0.3424657534246575,
+      "sampled_cpu_s": 0.14141414
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "sqlite3VdbeSerialGet",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 0.3424657534246575,
+      "sampled_cpu_s": 0.14141414
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "moveToChild",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 0.3424657534246575,
+      "sampled_cpu_s": 0.14141414
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "sock_recvmsg",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.3180039138943248,
+      "sampled_cpu_s": 0.13131313
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "user",
+      "symbol": "sqlite3_column_text",
+      "dso": "/home/mjc/bench/scooter-pr82-63eeda66/twelve-rust-poll-lazy-headers",
+      "sampled_cpu_percent": 0.3180039138943248,
+      "sampled_cpu_s": 0.13131313
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "tcp_rate_skb_sent",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.3180039138943248,
+      "sampled_cpu_s": 0.13131313
+    },
+    {
+      "thread": "ring-0",
+      "mode": "kernel",
+      "symbol": "clear_page_erms",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.29354207436399216,
+      "sampled_cpu_s": 0.12121212
+    },
+    {
+      "thread": "sqlite-requests",
+      "mode": "kernel",
+      "symbol": "copy_folio_from_iter_atomic",
+      "dso": "[kernel.kallsyms]",
+      "sampled_cpu_percent": 0.29354207436399216,
+      "sampled_cpu_s": 0.12121212
+    }
+  ],
+  "tracing": {
+    "tracing_stack_share_percent": 5.552837573385518,
+    "by_thread_percent": {
+      "sqlite-requests": 2.4706457925636007,
+      "ring-0": 3.0821917808219177
+    },
+    "direct_tracing_leaf_percent": 1.223091976516634,
+    "top_inclusive_paths": [
+      {
+        "symbol": "perf_trace_run_bpf_submit",
+        "CPU_percent": 3.7426614481409
+      },
+      {
+        "symbol": "trace_call_bpf",
+        "CPU_percent": 3.669275929549902
+      },
+      {
+        "symbol": "perf_trace_sys_exit",
+        "CPU_percent": 1.223091976516634
+      },
+      {
+        "symbol": "perf_trace_io_uring_complete",
+        "CPU_percent": 1.223091976516634
+      },
+      {
+        "symbol": "perf_trace_sys_enter",
+        "CPU_percent": 1.0273972602739725
+      },
+      {
+        "symbol": "perf_trace_io_uring_submit_req",
+        "CPU_percent": 0.8072407045009784
+      },
+      {
+        "symbol": "bpf_trampoline_6442531799",
+        "CPU_percent": 0.684931506849315
+      },
+      {
+        "symbol": "perf_trace_buf_alloc",
+        "CPU_percent": 0.3913894324853229
+      },
+      {
+        "symbol": "__cgroup_bpf_run_filter_skb",
+        "CPU_percent": 0.3669275929549902
+      },
+      {
+        "symbol": "__bpf_prog_run_save_cb",
+        "CPU_percent": 0.29354207436399216
+      },
+      {
+        "symbol": "perf_trace_io_uring_local_work_run",
+        "CPU_percent": 0.14677103718199608
+      },
+      {
+        "symbol": "__bpf_tramp_enter",
+        "CPU_percent": 0.07338551859099804
+      },
+      {
+        "symbol": "bpf_get_current_pid_tgid",
+        "CPU_percent": 0.04892367906066536
+      },
+      {
+        "symbol": "bpf_trampoline_6442513837",
+        "CPU_percent": 0.04892367906066536
+      },
+      {
+        "symbol": "bpf_skops_write_hdr_opt.isra.0",
+        "CPU_percent": 0.04892367906066536
+      }
+    ],
+    "scope": "Broad BPF sample union includes normal cgroup-network/scheduler BPF. Use narrower perf_trace_* or trace_call_bpf union to identify visible recorder tracepoint paths; this is not all observer overhead or a subtractable unprofiled-speedup estimate.",
+    "tracepoint_path_share_percent": 4.427592954990215,
+    "tracepoint_by_thread_percent": {
+      "sqlite-requests": 2.152641878669276,
+      "ring-0": 2.274951076320939
+    }
+  },
+  "specific_callpaths": {
+    "reset_ancestors": [
+      {
+        "caller": "<twelve_rust_poll::db::Db>::commit",
+        "CPU_percent": 9.58904109589041
+      },
+      {
+        "caller": "<twelve_rust_poll::db::Db>::like",
+        "CPU_percent": 5.136986301369863
+      },
+      {
+        "caller": "<twelve_rust_poll::db::Db>::create",
+        "CPU_percent": 0.611545988258317
+      },
+      {
+        "caller": "<twelve_rust_poll::db::Db>::read",
+        "CPU_percent": 0.19569471624266144
+      },
+      {
+        "caller": "<twelve_rust_poll::db::Db>::range_feed",
+        "CPU_percent": 0.02446183953033268
+      }
+    ],
+    "timer_callers": [
+      {
+        "stack": "sk_reset_timer -> tcp_event_new_data_sent -> tcp_write_xmit -> __tcp_push_pending_frames -> tcp_sendmsg_locked -> tcp_sendmsg",
+        "CPU_percent": 3.9138943248532287
+      }
+    ],
+    "conntrack_callers": [
+      {
+        "stack": "nf_conntrack_in -> nf_hook_slow -> __ip_local_out -> ip_local_out -> __ip_queue_xmit -> __tcp_transmit_skb",
+        "CPU_percent": 3.351272015655577
+      },
+      {
+        "stack": "nf_conntrack_in -> nf_hook_slow -> nf_hook_slow_list -> ip_sublist_rcv -> ip_list_rcv -> __netif_receive_skb_list_core",
+        "CPU_percent": 0.3913894324853229
+      }
+    ]
+  },
+  "summary": {
+    "SQL_worker_CPU_share_percent": 57.8,
+    "ring_CPU_share_percent": 42.2,
+    "read_path_inclusive_percent": 37.08,
+    "feed_range_inclusive_percent": 30.19,
+    "TCP_send_inclusive_percent": 24.95,
+    "statement_reset_inclusive_percent": 15.56,
+    "reset_commit_inclusive_percent": 9.59,
+    "reset_like_inclusive_percent": 5.14,
+    "JSON_string_inclusive_percent": 2.05,
+    "ring_SQL_channel_send_inclusive_percent": 0.49,
+    "timer_self_percent": 3.91,
+    "conntrack_lookup_self_percent": 3.47,
+    "interpretation": "Primary application hotspot is database read/feed work; major transport cost is kernel TCP send path. Reset time is mostly under commit/like writes, not feed reads. Visible tracing paths4.43% of sampleCPU; kernel BPF also includes normal networking policy and is not all observer overhead. Inclusive percentages overlap."
+  },
+  "peak_app_RSS_bytes": 107462656,
+  "caveats": [
+    "Sample shares represent on-CPU time, not wall-time latency or offCPU I/O waits.",
+    "Inclusive caller percentages overlap and must not be summed; exclusive leaves and thread/mode shares partition samples.",
+    "99Hz finite samples and asynchronous request counters make per-request CPU cost approximate.",
+    "Kernel samples occur in target thread context and may include networking/interrupt/BPF work; this is not whole-system CPU certification.",
+    "Unknown shared-library leaf symbols remain explicit rather than attributed to Rust or SQLite.",
+    "User/kernel sample proportions are cross-checked against task/cgroup accounting; differing accounting boundaries and sampling make these approximate, not exact cycle totals.",
+    "App cgroup2GiB and configuredcpu.max100000100000 with lavd are diagnostic; whole-system2GB/oneCPU/five-minute certification not established.",
+    "New repeat p9912.593ms versus earlier747.800ms with unchanged executable/settings: run-to-run observation, not a code speedup or isolated cause.",
+    "Task/cgroup user-system accounting and sampled leaf modes differ; per-thread totals agree0.01 percentage points. CPU/request is approximately12us, not walltime latency."
+  ],
+  "artifacts": {
+    "generator": "/home/mjc/projects/twelve-dollar-benchmark-no-goose/results/tali-scooter-frozen-header24-cache256-475000-20261015T164752Z/run",
+    "profile": "/home/mjc/projects/twelve-dollar-benchmark-no-goose/results/tali-scooter-frozen-header24-cache256-475000-20261015T164752Z/profile",
+    "flamegraph": "/home/mjc/projects/twelve-dollar-benchmark-no-goose/results/tali-scooter-frozen-header24-cache256-475000-20261015T164752Z/profile/flamegraph-steady.html",
+    "CPU_breakdown": "/home/mjc/projects/twelve-dollar-benchmark-no-goose/results/tali-scooter-frozen-header24-cache256-475000-20261015T164752Z/profile/cpu-steady.json",
+    "analysis_script": "/home/mjc/projects/twelve-dollar-benchmark-no-goose/results/tali-scooter-frozen-header24-cache256-475000-20261015T164752Z/profile/analyze-cpu-steady.py",
+    "remote_profile": "/home/mjc/bench/scooter-pr82-63eeda66/profiles/475k-20261015T164634Z"
+  },
+  "cleanup": {
+    "observer_absent_UTC": "2026-10-15T16:51:26.364362007Z",
+    "workers_running_UTC": "2026-10-15T16:51:33.002192314Z",
+    "canonical_release_UTC": "2026-10-15T16:53:09.610128Z",
+    "state": "Generatorcleanup confirmed, app/fiveownerrecorders commands/start identities verified then stopped, ports/listeners/established0 andREADYinvalidated; no extra run queued."
+  },
+  "raw_sha256": {
+    "perf.data": "260ea95760430f2b1130ab4570fc95bf0e17307cec2f11fa9c4c1fee87ad9ac1",
+    "perf-hold-flat.txt": "b2b6e5f66e05ea5187e7cd8c7579f1b9ed425ffb12d2cd0d400af27b3aca5190",
+    "perf-steady-script.txt": "9137e2f21a92bef437e6c794f62d11e23e3d2f5c3fdc9212d7197dbbbda844bb",
+    "cpu-steady.json": "fbf3bf1cf4f8e986d170c462ef31bf82b0f9af7d321253a03fe844662395e685",
+    "flamegraph-steady.html": "8a40343c6d108934d96973753c6d3d40b29898dc9cf5ae55a479438df9ad31a1",
+    "memory.jsonl": "ca3a45a960df19cd5c3b3c5b93e5efea15434107eb7261e1868d543e7a548284",
+    "storage.log": "7548afb31e4c3c2210e008e4d691d9439ed2d7abade25dca032f268a95d077a3",
+    "application-journal.log": "19796bd8682685a0512126997fdac8f4c8bf0829b3d7ec4178dd66340d3f7bd1",
+    "analyze-cpu-steady.py": "53b28f6231bb6fffefbc51a9a6c2f2933ba625d1eef618b6e5dbc74cf7eda91a"
+  }
+}

@@ -1,0 +1,116 @@
+{
+  "source_commit": "1ac99770690880ce27e462d4645ac0d3cb42ccb8",
+  "binary_sha256": "16814375ebcddf6497eb8fe84e4852548ee4edceb110a2e5958b0db0eb9eef45",
+  "build": "NativeTaliRust1.99/GCC16.2; release/native/fatLTO/onecodegenunit/defaultSQLitePGO/debug2/stripfalse/FP; freshsource build94s; extraCargo targetcleaned217.4MiB afterfreezing executable.",
+  "settings": "header24/cache256/mmap0/SQLworker/CQ32/retry1/wait25/freshseed; no source/runtime changes from13-input77412manifest",
+  "workload": {
+    "users": 475000,
+    "ramp_s": 60,
+    "hold_s": 75,
+    "drain_s": 30,
+    "grace_s": 10,
+    "generator": "Preserved5adb/27b; generatorownerpaused/restoredffmpeg"
+  },
+  "aggregate": {
+    "avg_ms": 10.290771307853436,
+    "checks_failed": 0,
+    "errors": {
+      "counts": {},
+      "examples": [],
+      "omitted": 0
+    },
+    "failed": 0,
+    "failure_rate": 0.0,
+    "max_ms": 1043.445774,
+    "med_ms": 0.512719,
+    "p95_ms": 1.139423,
+    "p99_ms": 472.2951887999998,
+    "requests": 6427321
+  },
+  "connections": {
+    "established": 475000,
+    "failed": 0,
+    "cancelled": 0
+  },
+  "hold": {
+    "memory_scope": "sampled cgroup memory.current, including descendants, socket buffers and page cache",
+    "requests_per_second": 50219.37698074409,
+    "sample_duration_s": 73.20182829,
+    "sample_finished_at": "2026-10-15T17:20:35.276363184+00:00",
+    "sample_started_at": "2026-10-15T17:19:22.074534894+00:00",
+    "sampled_peak_memory_bytes": 2147475456,
+    "service_cpu_percent": 59.5553786270056
+  },
+  "timestamps": {
+    "started_at": "2026-10-15T17:18:21.049967112Z",
+    "hold_started_at": "2026-10-15T17:19:21.050939115Z",
+    "hold_finished_at": "2026-10-15T17:20:36.051089773Z",
+    "finished_at": "2026-10-15T17:21:16.095970041Z"
+  },
+  "CPU": {
+    "window": {
+      "first_full_TCP_UTC": "2026-10-15T17:19:28.680559052+00:00",
+      "last_full_TCP_UTC": "2026-10-15T17:20:34.440026462+00:00",
+      "duration_s": 65.75946712493896,
+      "sample_rows": 34,
+      "completed_request_counter_delta": 3300381,
+      "perf_monotonic_lo": 244047.9408144951,
+      "perf_monotonic_hi": 244113.70028162003,
+      "scope": "Longest contiguous generator-sampled fullTCP segment; clock translation uses target UTC-minus-monotonic metadata."
+    },
+    "samples": 4048,
+    "sampled_CPU_s": 40.88888848,
+    "approx_sampled_CPU_us_per_completed_request": 12.389141883921885,
+    "thread_mode": [
+      {
+        "thread": "sqlite-requests",
+        "mode": "user",
+        "sampled_cpu_percent": 49.33300395256917,
+        "sampled_cpu_s": 20.17171697
+      },
+      {
+        "thread": "ring-0",
+        "mode": "kernel",
+        "sampled_cpu_percent": 36.58596837944664,
+        "sampled_cpu_s": 14.95959581
+      },
+      {
+        "thread": "sqlite-requests",
+        "mode": "kernel",
+        "sampled_cpu_percent": 8.794466403162057,
+        "sampled_cpu_s": 3.59595956
+      },
+      {
+        "thread": "ring-0",
+        "mode": "user",
+        "sampled_cpu_percent": 5.286561264822135,
+        "sampled_cpu_s": 2.16161614
+      }
+    ],
+    "actual_cgroup_CPU_counter_deltas_usec": {
+      "usage_usec": 38962276,
+      "user_usec": 22585564,
+      "system_usec": 16376713
+    },
+    "counter_window_s": 65.0728178024292
+  },
+  "storage": {
+    "max_COMMIT_us": 1042096,
+    "max_SQL_queue_us": 1042899,
+    "pending_max": 37434,
+    "first_checkpoint_UTC": "2026-10-15T17:21:17.236291+00:00",
+    "WAL_bytes_first_CP": 6079266032,
+    "scope": "1.042s COMMIT duringdrain withslowWALwrites; no checkpoint duringworkload. No matchedrequest attribution."
+  },
+  "artifacts": {
+    "root": "/home/mjc/projects/twelve-dollar-benchmark-no-goose/results/tali-scooter-actual-1ac9977-header24-cache256-475000-20261015T171510Z",
+    "remote_profile": "/home/mjc/bench/scooter-pr82-63eeda66/profiles/475k-20261015T171510Z",
+    "flamegraph": "/home/mjc/projects/twelve-dollar-benchmark-no-goose/results/tali-scooter-actual-1ac9977-header24-cache256-475000-20261015T171510Z/profile/flamegraph-steady.html"
+  },
+  "cleanup": "Generator/samplerdone; observerabsent17:22:12.274Z beforeworkersrestore; ownerapp+5recorders verifiedstopped/ports0/READYinvalid/released.",
+  "caveats": [
+    "Inclusivecallerpercentages overlap. No isolatedspeedup fromhistoryrewrite orrebuild.",
+    "Appcgroup2GiB is notwhole-system2GB; cpu.maxconfigured100000/100000 butlavdenforcementunproven.",
+    "Firstpreflight rejectedstaleCargo cache32 executable beforeanyload. Freshrebuildverifiedcache256; exactlyonecapacityload."
+  ]
+}

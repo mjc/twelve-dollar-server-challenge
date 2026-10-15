@@ -1,0 +1,28 @@
+{
+  "checked_source_manifest_entries": 13,
+  "manifest_matches_frozen_binary_source": "77412ab79a14ee3a03b9d4d50173f58397e1be5bcb986caca278daa9a0dcfb2d",
+  "optimized_unit_tests": {
+    "passed": 10,
+    "failed": 0,
+    "ignored": 2,
+    "note": "Ignored upstream tests require seeded fixtures."
+  },
+  "rebuilt_local_api": {
+    "binary_sha256": "14f5d7f2ccfe40cf4f7044665dc42867e82e5b75a3e19499ee65aa857e252a8f",
+    "official_checks": 42,
+    "nofile_hard": 65535,
+    "ports": [
+      36787
+    ],
+    "server_log": [
+      "SQLite effective mmap_size=0 cache_size=-262144",
+      "listening 127.0.0.1:36787; io_uring, 8 rings x 65535 direct descriptors; SQLite WAL/NORMAL"
+    ],
+    "artifact_directory": "/tmp/scooter-history-api-_2yq52xz",
+    "scope": "local API correctness only; no benchmark load"
+  },
+  "local_build_note": "Rebuilt in shared devenv on Tina; different executable hash is expected from compiler/CPU/path/build inputs. No capacity run or claim for this new local executable. The measured runtime stays frozen77412ab7.",
+  "shell_syntax": "build.sh/install.sh/start.sh passed bash -n",
+  "diff_whitespace": "git diff --check passed",
+  "no_target_actions": true
+}
