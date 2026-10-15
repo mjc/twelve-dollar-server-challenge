@@ -98,7 +98,7 @@ targets a 32 MiB SQLite page cache by default. Successful likes rely on SQLite's
 foreign-key checks; post existence is queried only for duplicates and foreign-key
 failures.
 
-Dependencies: Rust 1.99.0, Axum 0.8.9, Mio 1.2.4, rusqlite 0.40.2 with bundled SQLite,
+Dependencies: Rust 1.99.1, Axum 0.8.9, Mio 1.2.4, rusqlite 0.40.2 with bundled SQLite,
 jsonwebtoken 11.1.0, Divan 0.1.21, Gungraun 0.20.0, and Mold 3.0.0.
 The bundled SQLite build disables optional global page-cache memory management
 through shared Cargo configuration, including the contest build.
@@ -146,7 +146,7 @@ slow commits, and checkpoint timing. It is disabled by default.
 
 ## Development
 
-Use Rust 1.99.0 with rustfmt and Clippy. The instruction benchmarks require
+Use Rust 1.99.1 with rustfmt and Clippy. The instruction benchmarks require
 Gungraun runner 0.20.0 and Valgrind. Local shell setup and profiling orchestration
 are maintained outside this submission in the shared development configuration.
 

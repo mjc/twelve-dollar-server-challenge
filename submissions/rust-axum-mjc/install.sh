@@ -13,15 +13,15 @@ case "$(uname -m)" in
   aarch64) target=aarch64-unknown-linux-gnu ;;
   *) echo 'unsupported architecture' >&2; exit 1 ;;
 esac
-if [[ ! -x /opt/rust-1.99.0/bin/rustc ]]; then
-  archive="rust-1.99.0-$target.tar.xz"
+if [[ ! -x /opt/rust-1.99.1/bin/rustc ]]; then
+  archive="rust-1.99.1-$target.tar.xz"
   curl --fail --location --retry 3 -o "$archive" "https://static.rust-lang.org/dist/$archive"
   curl --fail --location --retry 3 -o "$archive.sha256" "https://static.rust-lang.org/dist/$archive.sha256"
   sha256sum --check "$archive.sha256"
   tar -xf "$archive"
-  "rust-1.99.0-$target/install.sh" --prefix=/opt/rust-1.99.0 --without=rust-docs
+  "rust-1.99.1-$target/install.sh" --prefix=/opt/rust-1.99.1 --without=rust-docs
 fi
-export PATH="/opt/rust-1.99.0/bin:$PATH"
+export PATH="/opt/rust-1.99.1/bin:$PATH"
 export CARGO_HOME="$HERE/.install/cargo"
 if [[ ! -x /opt/mold-3.0.0/bin/mold ]]; then
   curl --fail --location --retry 3 -o mold-3.0.0.tar.gz https://github.com/rui314/mold/archive/refs/tags/v3.0.0.tar.gz

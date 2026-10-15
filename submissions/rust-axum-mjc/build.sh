@@ -2,8 +2,8 @@
 set -euo pipefail
 HERE="$(cd -- "$(dirname -- "$0")" && pwd)"
 cd "$HERE"
-if [[ -d /opt/rust-1.99.0 ]]; then
-  export PATH="/opt/rust-1.99.0/bin:/opt/mold-3.0.0/bin:$PATH"
+if [[ -d /opt/rust-1.99.1 ]]; then
+  export PATH="/opt/rust-1.99.1/bin:/opt/mold-3.0.0/bin:$PATH"
   export MOLD_LIBDIR=/opt/mold-3.0.0/lib/mold
   export RUSTFLAGS="-C force-frame-pointers=yes -C link-arg=-fuse-ld=mold"
 fi
