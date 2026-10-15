@@ -86,7 +86,7 @@ timestamp and ID order, then counts likes through the existing post-ID index.
 The same query handles short and sparse feeds without additional ID queries
 or a separate range path.
 The supplied schema and indexes are left unchanged. The request connection
-targets a 256 MiB SQLite page cache by default. Successful likes rely on SQLite's
+targets a 64 MiB SQLite page cache by default. Successful likes rely on SQLite's
 foreign-key checks; post existence is queried only for duplicates and foreign-key
 failures.
 
@@ -130,7 +130,7 @@ accepts `true` or `false` and defaults to `true`.
 `SQLITE_MMAP_SIZE` sets the request connection's mmap size in bytes and defaults
 to `0`; startup reports both the requested and effective sizes.
 `SQLITE_PAGE_CACHE_KIB` sets the request connection's page-cache target in KiB
-and defaults to `262144` (256 MiB). Set it to `131072` for a 128 MiB target.
+and defaults to `65536` (64 MiB). Set it to `131072` for a 128 MiB target.
 It must be positive, fit a signed 32-bit KiB value, and cover between one and
 one billion database pages. Startup reports the selected target.
 `SQLITE_TIMINGS=true` records queue waits and timeouts, batch sizes and durations,
