@@ -65,8 +65,9 @@ const STORAGE_POLICY: StoragePolicy = StoragePolicy {
 const REQUEST_CAPACITY: usize = 4096;
 // Match the benchmark p99 ceiling; admission and execution both count toward latency.
 const REQUEST_ADMISSION_TIMEOUT: Duration = Duration::from_secs(1);
-const READ_BATCH_LIMIT: usize = 255;
-const WRITE_BATCH_LIMIT: usize = 255;
+const READ_BATCH_LIMIT: usize = 1024;
+const WRITE_BATCH_LIMIT: usize = 1024;
+const BATCH_COLLECTION_WINDOW: Duration = Duration::from_millis(1);
 
 fn sqlite_timings_enabled() -> bool {
     std::env::var("SQLITE_TIMINGS").is_ok_and(|value| {
@@ -530,22 +531,37 @@ impl Request {
     }
 }
 
+// A producer unparks this worker after publishing a request. The thread's
+// retained wake token closes the race between observing an empty queue and
+// parking; spurious wakes simply recheck the queue and the same deadline.
+fn receive_until(receiver: &mut mpsc::Receiver<Request>, deadline: Instant) -> Option<Request> {
+    loop {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        match receiver.try_recv() {
+            Ok(request) => return Some(request),
+            Err(mpsc::error::TryRecvError::Disconnected) => return None,
+            Err(mpsc::error::TryRecvError::Empty) => std::thread::park_timeout(remaining),
+        }
+    }
+}
+
 fn collect_read_batch(
     first: Request,
     receiver: &mut mpsc::Receiver<Request>,
     batch: &mut [Option<Request>; READ_BATCH_LIMIT],
 ) -> (usize, Option<Request>) {
     debug_assert!(first.is_read());
+    let deadline = Instant::now() + BATCH_COLLECTION_WINDOW;
     batch[0] = Some(first);
     let mut len = 1;
     while len < READ_BATCH_LIMIT {
-        match receiver.try_recv() {
-            Ok(request) if request.is_read() => {
+        match receive_until(receiver, deadline) {
+            Some(request) if request.is_read() => {
                 batch[len] = Some(request);
                 len += 1;
             }
-            Ok(write) => return (len, Some(write)),
-            Err(_) => return (len, None),
+            Some(write) => return (len, Some(write)),
+            None => return (len, None),
         }
     }
     (len, None)
@@ -787,15 +803,16 @@ fn collect_write_batch(
     batch: &mut [Option<Request>; WRITE_BATCH_LIMIT],
 ) -> usize {
     debug_assert!(!first.is_read());
+    let deadline = Instant::now() + BATCH_COLLECTION_WINDOW;
     batch[0] = Some(first);
     let mut len = 1;
     while len < WRITE_BATCH_LIMIT {
-        match receiver.try_recv() {
-            Ok(request) => {
+        match receive_until(receiver, deadline) {
+            Some(request) => {
                 batch[len] = Some(request);
                 len += 1;
             }
-            Err(_) => break,
+            None => break,
         }
     }
     len
@@ -1028,6 +1045,7 @@ fn fail_write_request(request: Request, message: &str) -> WriteCompletion {
 #[derive(Clone)]
 pub struct Db {
     requests: mpsc::Sender<Request>,
+    worker_thread: std::thread::Thread,
     write_admission_closed: Arc<AtomicBool>,
 }
 
@@ -1117,7 +1135,7 @@ impl Db {
         };
 
         // The channel bounds queued requests at 4096; the worker additionally
-        // dequeues at most one mixed write batch or read batch of 255.
+        // dequeues at most one mixed write batch or read batch of 1024.
         let (requests, mut receiver) = mpsc::channel::<Request>(REQUEST_CAPACITY);
         let (startup_tx, startup_rx) = std_mpsc::channel();
         let worker_sqlite_timings = sqlite_timings;
@@ -1245,6 +1263,7 @@ impl Db {
         }
         Ok(Self {
             requests,
+            worker_thread: worker.thread().clone(),
             write_admission_closed,
         })
     }
@@ -1261,6 +1280,7 @@ impl Db {
         let permit = self.reserve_request().await?;
         let (reply, receiver) = oneshot::channel();
         permit.send(make(reply));
+        self.worker_thread.unpark();
         receiver.await.map_err(|_| DbError::WorkerUnavailable)?
     }
 
@@ -1277,6 +1297,7 @@ impl Db {
 
         let (reply, receiver) = oneshot::channel();
         permit.send(make(reply));
+        self.worker_thread.unpark();
         receiver.await.map_err(|_| DbError::WorkerUnavailable)?
     }
 
@@ -1976,6 +1997,7 @@ mod tests {
         let db = Db {
             requests,
             write_admission_closed: Arc::new(AtomicBool::new(false)),
+            worker_thread: std::thread::current(),
         };
         assert!(matches!(db.health().await, Err(DbError::WorkerUnavailable)));
     }
@@ -1986,6 +2008,7 @@ mod tests {
         let db = Db {
             requests,
             write_admission_closed: Arc::new(AtomicBool::new(false)),
+            worker_thread: std::thread::current(),
         };
         let first_db = db.clone();
         let first = tokio::spawn(async move { first_db.health().await });
@@ -2029,6 +2052,7 @@ mod tests {
             let db = Db {
                 requests,
                 write_admission_closed: Arc::new(AtomicBool::new(false)),
+                worker_thread: std::thread::current(),
             };
             let (reply, _result) = oneshot::channel();
             db.requests.try_send(Request::Health(reply)).unwrap();
@@ -2062,6 +2086,7 @@ mod tests {
         let db = Db {
             requests,
             write_admission_closed: Arc::new(AtomicBool::new(false)),
+            worker_thread: std::thread::current(),
         };
         let (reply, _result) = oneshot::channel();
         db.requests.try_send(Request::Health(reply)).unwrap();
@@ -2186,8 +2211,8 @@ mod tests {
             matches!(receiver.try_recv(), Ok(Request::Post(id, _)) if id == READ_BATCH_LIMIT as i64 + 1)
         );
 
-        // An empty queue ends collection immediately rather than waiting for a
-        // future request to arrive and join the current snapshot.
+        // An empty queue ends collection when the bounded collection window
+        // expires; no later request is needed to complete the batch.
         let (reply, _response) = oneshot::channel();
         let (len, pending) =
             collect_read_batch(Request::Post(10, reply), &mut receiver, &mut batch);

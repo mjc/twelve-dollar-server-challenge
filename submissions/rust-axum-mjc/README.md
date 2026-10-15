@@ -11,8 +11,10 @@ grows them as needed. Its configured minimum and default maximum remain
 8 KiB and 417,792 bytes; request-size limits are unchanged. The upstream source
 and local patch are documented in [vendor/hyper/LOCAL-PATCHES.md](vendor/hyper/LOCAL-PATCHES.md).
 A bounded queue keeps database
-work off the HTTP event loop. Up to 4,096 jobs occupy channel slots, with at most 255 dequeued jobs in either a mixed
-write batch or a read batch.
+work off the HTTP event loop. Up to 4,096 jobs occupy channel slots, with at most
+1,024 dequeued jobs in either a mixed write batch or a read batch. Collection ends
+when the batch fills or 1 ms after its first request. Read batches also stop at
+the next write.
 Requests wait up to 1 second, the benchmark p99 ceiling, to acquire a channel
 slot before receiving HTTP 503. Execution adds to that admission wait, so the
 ceiling is an overload cutoff rather than a latency guarantee.
@@ -27,11 +29,10 @@ Read batches also retain prepared transaction-control statements. A failed
 commit rolls back before replies; if cleanup leaves a transaction open, the
 worker closes that connection.
 
-When the worker reaches a write, it freezes up to 255 already-queued requests
-and processes them in queue order in one transaction. Intervening reads share
+When the worker reaches a write, it collects up to 1,024 requests within the
+1 ms window and processes them in queue order in one transaction. Intervening reads share
 that transaction, and their responses wait for the same commit as the writes.
-The worker never waits for additional arrivals to fill a batch. Per-write
-savepoints isolate failed writes, while a failed group commit rolls back and
+Per-write savepoints isolate failed writes, while a failed group commit rolls back and
 fails the affected replies. Canceled requests are skipped before execution;
 canceling a response after execution does not undo its write.
 
