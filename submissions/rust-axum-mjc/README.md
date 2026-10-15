@@ -35,6 +35,14 @@ same batch. Read batches retain prepared transaction-control statements. A faile
 commit rolls back before replies; if cleanup leaves a transaction open, the
 worker closes that connection.
 
+On Unix, both database connections use SQLite's
+[unix-excl filesystem backend](https://www.sqlite.org/vfs.html). The temporary
+index that locates pages in the WAL lives in process memory, so updating it
+avoids filesystem write faults in the `-shm` file. The SQL worker and checkpoint
+thread retain separate connections. Other SQLite processes must wait until the
+server releases the database lock. The database and WAL remain on disk, with
+NORMAL synchronization and successful write responses sent after commit.
+
 When the worker reaches a write, it collects up to 1,024 requests within the
 1 ms window and processes them in queue order in one transaction. Intervening reads share
 that transaction, and their responses wait for the same commit as the writes.

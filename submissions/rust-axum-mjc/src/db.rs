@@ -1013,6 +1013,22 @@ pub struct Db {
     admission_timings: Option<Arc<AdmissionTimings>>,
 }
 
+fn open_worker_connection(path: &Path) -> rusqlite::Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    // Both connections belong to this process. unix-excl keeps their shared
+    // WAL index in heap memory, avoiding filesystem faults when updating -shm.
+    // The database and WAL remain on disk. Other SQLite processes must wait
+    // until this process releases the database lock.
+    #[cfg(unix)]
+    {
+        Connection::open_with_flags_and_vfs(path, flags, "unix-excl")
+    }
+    #[cfg(not(unix))]
+    {
+        Connection::open_with_flags(path, flags)
+    }
+}
+
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         Self::open_with_read_batching(path, true)
@@ -1044,10 +1060,7 @@ impl Db {
         if path.as_os_str().is_empty() || path == Path::new(":memory:") {
             return Err(DbError::InvalidPath);
         }
-        let connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        let connection = open_worker_connection(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         let journal_mode: String =
             connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
@@ -1062,10 +1075,7 @@ impl Db {
         connection.pragma_update(None, "journal_size_limit", 0)?;
         configure_page_cache(&connection, page_cache_kib)?;
         let effective_mmap_size = configure_mmap_size(&connection, mmap_size_bytes)?;
-        let checkpoint_connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        let checkpoint_connection = open_worker_connection(path)?;
         checkpoint_connection.busy_timeout(Duration::ZERO)?;
         checkpoint_connection.pragma_update(None, "synchronous", "NORMAL")?;
         checkpoint_connection.pragma_update(None, "wal_autocheckpoint", 0)?;
