@@ -20,6 +20,7 @@ unsafe extern "C" {
         vfs: *const c_char,
     ) -> c_int;
     fn sqlite3_close(db: *mut Connection) -> c_int;
+    fn sqlite3_db_status64(db: *mut Connection, op: c_int, current: *mut i64, high: *mut i64, reset: c_int) -> c_int;
     fn sqlite3_errmsg(db: *mut Connection) -> *const c_char;
     fn sqlite3_exec(
         db: *mut Connection,
@@ -156,6 +157,17 @@ impl Db {
     pub(crate) fn batch(&self) -> checkpoint::Batch {
         checkpoint::Batch::new(Arc::clone(&self.activity))
     }
+    pub(crate) fn cache_stats(&self) -> [i64; 3] {
+        // CACHE_USED/HIT/MISS are pager-local and do not require global memstatus.
+        // Called by the serialized connection owner, never by the ring thread.
+        let mut values = [0; 3];
+        for (value, op) in values.iter_mut().zip([1, 7, 8]) {
+            let mut high = 0;
+            // SAFETY: this connection remains live and both outputs are initialized.
+            assert_eq!(unsafe { sqlite3_db_status64(self.raw, op, value, &mut high, 0) }, 0);
+        }
+        values
+    }
     pub fn open(path: &str, group: bool) -> Self {
         let path = CString::new(path).expect("SQLITE_PATH contains NUL");
         let mut raw = ptr::null_mut();
@@ -184,7 +196,7 @@ impl Db {
         }
         exec(
             raw,
-            "PRAGMA locking_mode=NORMAL; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA mmap_size=1073741824; PRAGMA cache_size=-262144; PRAGMA temp_store=MEMORY; PRAGMA journal_size_limit=-1; PRAGMA wal_autocheckpoint=0; SELECT count(*) FROM sqlite_schema;",
+            "PRAGMA locking_mode=NORMAL; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA mmap_size=0; PRAGMA cache_size=-262144; PRAGMA temp_store=MEMORY; PRAGMA journal_size_limit=-1; PRAGMA wal_autocheckpoint=0; SELECT count(*) FROM sqlite_schema;",
         );
         fn prepare(raw: *mut Connection, sql: &str) -> Stmt {
             let sql = CString::new(sql).unwrap();
@@ -195,6 +207,14 @@ impl Db {
                 "prepare statement"
             );
             Stmt(stmt)
+        }
+        // Mapped reads search the growing WAL index on every page access.
+        // Ordinary pager-cache hits avoid that repeated lookup; retain cache size.
+        {
+            let mut effective_mmap = prepare(raw, "PRAGMA mmap_size");
+            assert_eq!(effective_mmap.step(), ROW);
+            assert_eq!(effective_mmap.int(0), 0, "effective SQLite mmap_size");
+            eprintln!("SQLite effective mmap_size=0 cache_size=-262144");
         }
         let select = "SELECT p.id,p.body,p.created_at,u.username,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) FROM posts p JOIN users u ON u.id=p.user_id";
         let mut db = Self {

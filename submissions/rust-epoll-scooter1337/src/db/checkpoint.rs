@@ -178,6 +178,8 @@ mod tests {
             assert!(db.commit());
         }
         assert!(db.wal_frames.load(Ordering::Relaxed) >= 1000);
+        let [cache, hits, _] = db.cache_stats();
+        assert!(cache > 0 && hits > 0, "pager counters work with memstatus disabled");
         let (log, backfilled) = wait_for(&db, |log, backfilled| backfilled > 0 && backfilled < log);
         assert!(
             backfilled < log,
@@ -221,6 +223,8 @@ mod tests {
             assert!(db.commit());
         }
         assert!(db.wal_frames.load(Ordering::Relaxed) >= 1000);
+        let [cache, hits, _] = db.cache_stats();
+        assert!(cache > 0 && hits > 0, "pager counters work with memstatus disabled");
         // A stalled batch must remain busy even when the request queue is empty.
         thread::sleep(Duration::from_millis(2200));
         let (log, backfilled) = progress(&db).unwrap();

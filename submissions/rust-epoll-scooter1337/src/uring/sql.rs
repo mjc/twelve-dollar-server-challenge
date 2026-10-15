@@ -231,6 +231,7 @@ pub(super) fn start(app: Arc<Mutex<App>>, rings: usize) -> io::Result<Vec<Port>>
             let committed = app.db.commit();
             commit_max = commit_max.max(start.elapsed().as_micros());
             let commit_end = if traced { crate::latency_trace::now() } else { 0 };
+            let cache_stats = (second.elapsed().as_secs() >= 1).then(|| app.db.cache_stats());
             drop(batch_activity);
             drop(app);
             let mut wake = 0u64;
@@ -245,8 +246,8 @@ pub(super) fn start(app: Arc<Mutex<App>>, rings: usize) -> io::Result<Vec<Port>>
             for (id, completed) in completed.iter().enumerate() {
                 if wake & (1 << id) != 0 { notify(&completed.wake); }
             }
-            if second.elapsed().as_secs() >= 1 {
-                eprintln!("SQL_WORKER requests={count} pending={} queue_max_us={queue_max} commit_max_us={commit_max}", pending.load(Ordering::Relaxed));
+            if let Some([cache, hits, misses]) = cache_stats {
+                eprintln!("SQL_WORKER requests={count} pending={} queue_max_us={queue_max} commit_max_us={commit_max} cache_used_bytes={cache} cache_hits={hits} cache_misses={misses}", pending.load(Ordering::Relaxed));
                 queue_max = 0; commit_max = 0; second = Instant::now();
             }
         }
