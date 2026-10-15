@@ -17,8 +17,7 @@ The idle map's key holds the token; only active sessions carry another copy.
 Active sessions have separate Tokio tasks and scheduling budgets. Readiness
 batches contain at most 1,024 events; the server does not scan idle sockets.
 There are at most 8,192 active sessions and one shared epoll descriptor. Active
-entries retain kernel storage until close or shutdown. The CPU and memory effects
-of retaining these entries have not yet been measured under comparable load.
+entries retain kernel storage until close or shutdown.
 Hyper uses Tokio sockets through its native adapter while active, avoiding a
 second transport buffer and boxed completion-I/O futures for reads and flushes.
 The vendored Hyper 1.12.0 starts HTTP/1 reads at 1 KiB and allocates response
@@ -105,8 +104,7 @@ joins use the original feed query, whose limit follows the join. All queries use
 the request's current transaction; no result survives between requests.
 The range path serializes into worker scratch storage, then copies those bytes
 into the response. Scratch contents are cleared on success, fallback, and error;
-at most 64 KiB of capacity is retained. The extra byte copy and retained scratch
-are unmeasured CPU and memory tradeoffs against the original query.
+at most 64 KiB of capacity is retained.
 The supplied schema and indexes are left unchanged. The request connection
 targets a 32 MiB SQLite page cache by default. Successful likes rely on SQLite's
 foreign-key checks; post existence is queried only for duplicates and foreign-key
@@ -209,7 +207,28 @@ retains full DWARF symbols with the release optimization settings. Rust and
 bundled SQLite preserve frame pointers. Run perf, heaptrack, or Pyroclast against
 that executable; deployment and recording scripts live in the shared devshell.
 
-### Capacity measurements
+### Ubuntu VM comparison
+
+These 125,000-user runs used Ubuntu 24.04 with one vCPU, 2 GiB RAM, no swap,
+ten listeners, a 32 MiB SQLite cache, and mmap disabled. Each used a fresh seed,
+a 60-second ramp, 60-second nominal user hold, 30-second drain and 10-second
+grace period, with the normal observer and 99 Hz CPU profile.
+
+| Build | Run p95 / p99 | HTTP errors | Hold app CPU | Hold whole-VM CPU |
+| --- | ---: | ---: | ---: | ---: |
+| Before (`1ae2cc4`) | 173.23 / 1,363.31 ms | 5,144 (0.346%) | 52.82% | 78.16% |
+| Three changes together (`85bde84`) | 3.64 / 17.95 ms | 0 | 37.37% | 64.58% |
+
+Hold throughput was about 13,210 and 13,206 requests/s respectively. Reported
+hold CPU and throughput imply about 40.0 versus 28.3 microseconds of app CPU per
+request. The three changes were vectored response writes, the range feed query,
+and persistent epoll entries. This is one run per build, with no measurement of
+each change separately. The earlier run followed a ladder of lower loads; the
+new run started from a clean VM. The earlier errors coincided with I/O wait
+during ramp, so this comparison does not establish that the storage stall is
+fixed. These one-minute holds do not establish the five-minute contest result.
+
+### Earlier capacity measurements
 
 The same optimized binary and ten listeners produced:
 

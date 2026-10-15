@@ -32,7 +32,8 @@ Both queued strategies return empty header vectors to the same bounded pool only
 after all output drains. Hyper borrows a bounded stack array of `IoSlice`s for
 each poll; partial and pending writes retain ownership of the original buffers.
 The deferred socket adapter forwards vectored writes for plain and Tokio sockets.
-This candidate has not been measured against the scalar queue under comparable load.
+The application measured this with its feed and idle-epoll changes; the separate
+effect of vectored writes has not been measured.
 `BufList` now requests one element of deque capacity on its first queued body;
 the application returns `Full<Bytes>` bodies as a single data buffer.
 Further streamed buffers still use normal deque growth and preserve ordering.
