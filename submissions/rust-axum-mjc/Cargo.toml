@@ -24,6 +24,7 @@ tower = { version = "=0.5.3", features = ["make", "util"] }
 
 [patch.crates-io]
 hyper = { path = "vendor/hyper" }
+tokio = { path = "vendor/tokio" }
 
 [dev-dependencies]
 divan = "=0.1.21"
