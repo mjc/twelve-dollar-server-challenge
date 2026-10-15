@@ -11,6 +11,7 @@ use axum::{
     },
     response::{IntoResponse, Response as AxumResponse},
 };
+use futures_util::FutureExt;
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming as HyperIncoming, service::Service as HyperService};
 use serde::{Deserialize, Serialize};
@@ -39,8 +40,7 @@ where
 {
     let state = app_state(db, auth);
     service_fn(move |request: Request<B>| {
-        let state = Arc::clone(&state);
-        async move { Ok::<_, Infallible>(dispatch(state, request).await) }
+        dispatch(Arc::clone(&state), request).map(Ok::<_, Infallible>)
     })
 }
 
@@ -59,8 +59,7 @@ pub fn hyper_router(
 + 'static {
     let state = app_state(db, auth);
     hyper::service::service_fn(move |request: Request<HyperIncoming>| {
-        let state = Arc::clone(&state);
-        async move { Ok::<_, Infallible>(dispatch(state, request).await) }
+        dispatch(Arc::clone(&state), request).map(Ok::<_, Infallible>)
     })
 }
 
