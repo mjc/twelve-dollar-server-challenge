@@ -1,0 +1,107 @@
+{
+  "implementation": "Scooter raw io_uring / SQLite",
+  "upstream_repository": "https://github.com/Scooter1337/twelve-dollar-server-challenge",
+  "upstream_branch": "codex/rust-io-uring-v2",
+  "tested_upstream_commit": "63eeda6655a0ba12f763b337545ae36041ffdbf3",
+  "newer_upstream_commit_not_included": "932131523fe0a16d8ad99f1f1ca0cab48ec79376",
+  "frozen_binary_sha256": "77412ab79a14ee3a03b9d4d50173f58397e1be5bcb986caca278daa9a0dcfb2d",
+  "source_manifest_sha256": {
+    "Cargo.toml": "cba81e35a7ce21155e2e7b300c0102a0029ca07e80cc2f94c24fe921132265f2",
+    "Cargo.lock": "436f527291afa15c52a8fe6ee157c392408ad18b6ce59f784c63d4c5cec43ad7",
+    "build.rs": "b6eceea59f1517912781c440cb900d4778a01975a196a8aff237431fef358849",
+    "src/db.rs": "0d52f44e4f1fb286901465f2221f5e082a30f2290b8c3b74b81293891a54c3e8",
+    "src/db/checkpoint.rs": "c735f5a80472e593faa9696ed36e47ce70f368c9c028e58ac1157711718a8941",
+    "src/latency_trace.rs": "23f937eaa77cb6c75b5bc528fdc340c9246f83191b2941c4467f67ad56126750",
+    "src/main.rs": "867d32358773b95ba53fdf7393f0b4ec9b4d10bb97494d97dbef4e591bac0cdd",
+    "src/net.rs": "1bf4166db13cddf8f057653dbdc05ec87618437cbeb621426221bc9c8dfb404d",
+    "src/uring.rs": "2df3e3a845c9b6696208caca16dbf533fbf20d1cdda011dedb4a52dec6e04e61",
+    "src/uring/sql.rs": "e1f853fae03454ba594e64bc0d312d73041de38add3f225df779725cd5b5a08b",
+    "vendor/sqlite3.c": "b1dd5d74ec7f29055a6684fa06fb3c2f6821c87dd38f9a458dfd2e8a1db28189",
+    "vendor/sqlite3.h": "919e7f2e8ed1d8f56ac17b412b8971c76aa5d1a879752cc6058f75e7d5910e1d",
+    "bench/train_sqlite.c": "dd7d056bf259e587e8a21b902bb5469b4ea75b41a511c00d328eacb019a48967"
+  },
+  "build": "Rust1.99.0 b940084d7, GCC16.2.0, native/fatLTO/1codegenunit/defaultSQLitePGO; debug2/stripfalse; RUSTFLAGS=-Ctarget-cpu=native plusdevenvdefaults; CFLAGS=-g -fno-omit-frame-pointer; jobs1",
+  "native_unit_tests": {
+    "enabled_passed": 10,
+    "fixture_ignored": 2
+  },
+  "native_api": {
+    "binary_sha256": "77412ab79a14ee3a03b9d4d50173f58397e1be5bcb986caca278daa9a0dcfb2d",
+    "official_checks": 42,
+    "nofile_hard": 65535,
+    "ports": [
+      46039
+    ],
+    "server_log": [
+      "SQLite effective mmap_size=0 cache_size=-262144",
+      "listening 127.0.0.1:46039; io_uring, 8 rings x 65535 direct descriptors; SQLite WAL/NORMAL"
+    ],
+    "artifact_directory": "/home/mjc/bench/scooter-pr82-63eeda66/lazy-header-candidate/shutdown-api-e3qe23mr",
+    "scope": "local API correctness only; no benchmark load"
+  },
+  "source_history": [
+    {
+      "stage": "01-checkpoint-ports",
+      "original_implementation_commit": "e63f209",
+      "new_commit": "f77782512809a349cb0e9a72e79cacbd68e9502d",
+      "author_name": "Mika Cohen",
+      "author_email": "mjc@kernel.org",
+      "author_date": "2026-10-15T03:07:09-06:00"
+    },
+    {
+      "stage": "02-diagnostics",
+      "original_implementation_commit": "f3cbd0d",
+      "new_commit": "94a4135c1572e1f5fb1c918ffa40a0d7c0c15b28",
+      "author_name": "Mika Cohen",
+      "author_email": "mjc@kernel.org",
+      "author_date": "2026-10-15T04:11:10-06:00"
+    },
+    {
+      "stage": "03-shutdown",
+      "original_implementation_commit": "f183743",
+      "new_commit": "df4f332d50397e85f2ba763d9f35eb40d93bedf7",
+      "author_name": "Mika Cohen",
+      "author_email": "mjc@kernel.org",
+      "author_date": "2026-10-15T04:44:13-06:00"
+    },
+    {
+      "stage": "04-sql-worker",
+      "original_implementation_commit": "2d7d0e9",
+      "new_commit": "b15b7da94437bd0a2d5b8ecb54c954c8219739a6",
+      "author_name": "Mika Cohen",
+      "author_email": "mjc@kernel.org",
+      "author_date": "2026-10-15T06:39:24-06:00"
+    },
+    {
+      "stage": "05-idle-input",
+      "original_implementation_commit": "09f30fc",
+      "new_commit": "e9a8e00c0f0c065195f0500b4a2a708f549de240",
+      "author_name": "Mika Cohen",
+      "author_email": "mjc@kernel.org",
+      "author_date": "2026-10-15T07:08:06-06:00"
+    },
+    {
+      "stage": "06-pager",
+      "original_implementation_commit": "3c56644",
+      "new_commit": "f50d7b18cba4a4502bcde48f1614fd197e4dce55",
+      "author_name": "Mika Cohen",
+      "author_email": "mjc@kernel.org",
+      "author_date": "2026-10-15T07:23:40-06:00"
+    },
+    {
+      "stage": "07-headers",
+      "original_implementation_commit": "5d73a45",
+      "new_commit": "a3b5a43ef329128f9011674819f3c96da03fd41d",
+      "author_name": "Mika Cohen",
+      "author_email": "mjc@kernel.org",
+      "author_date": "2026-10-15T08:03:36-06:00"
+    }
+  ],
+  "excluded_candidates": [
+    "chunked-copy patch71203b6",
+    "cache32 candidate86c1bcd (latency failure at500k)",
+    "1024-job SQL coalescing candidatecf00c3b (unbenchmarked)"
+  ],
+  "vendor_note": "SQLite is downloaded by upstream build.sh using a fixed archive SHA; ignored generated vendor/sqlite3.c and .h must match this manifest. All other manifest entries are tracked.",
+  "upstream_branch_tip_note": "The named upstream branch now points to9321315;63eeda6 is its unchanged predecessor used for the frozen runtime. No later source fixes are implied by the frozen measurements."
+}
