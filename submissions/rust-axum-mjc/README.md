@@ -86,7 +86,7 @@ timestamp and ID order, then counts likes through the existing post-ID index.
 The same query handles short and sparse feeds without additional ID queries
 or a separate range path.
 The supplied schema and indexes are left unchanged. The request connection
-targets a 64 MiB SQLite page cache by default. Successful likes rely on SQLite's
+targets a 32 MiB SQLite page cache by default. Successful likes rely on SQLite's
 foreign-key checks; post existence is queried only for duplicates and foreign-key
 failures.
 
@@ -130,7 +130,7 @@ accepts `true` or `false` and defaults to `true`.
 `SQLITE_MMAP_SIZE` sets the request connection's mmap size in bytes and defaults
 to `0`; startup reports both the requested and effective sizes.
 `SQLITE_PAGE_CACHE_KIB` sets the request connection's page-cache target in KiB
-and defaults to `65536` (64 MiB). Set it to `131072` for a 128 MiB target.
+and defaults to `32768` (32 MiB). Set it to `65536` for a 64 MiB target.
 It must be positive, fit a signed 32-bit KiB value, and cover between one and
 one billion database pages. Startup reports the selected target.
 `SQLITE_TIMINGS=true` records queue waits and timeouts, batch sizes and durations,
@@ -181,18 +181,19 @@ that executable; deployment and recording scripts live in the shared devshell.
 
 ### Capacity measurements
 
-The same optimized binary, ten listeners, and 256 MiB SQLite cache produced:
+The same optimized binary and ten listeners produced:
 
-| Connections | Hold requests/s | p95 / p99 | Errors | Peak server RSS | Hold CPU, one core = 100% |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 400,000 | 42,195 | 5.50 / 25.77 ms | 0 | 244.22 MiB | 96.14% |
-| 450,000 | 47,509 | 4.71 / 50.13 ms | 0 | 329.65 MiB | 106.86% |
+| Connections | SQLite cache | Hold requests/s | p95 / p99 | Errors | Peak server RSS | Hold CPU, one core = 100% |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 400,000 | 256 MiB | 42,195 | 5.50 / 25.77 ms | 0 | 244.22 MiB | 96.14% |
+| 450,000 | 256 MiB | 47,509 | 4.71 / 50.13 ms | 0 | 329.65 MiB | 106.86% |
+| 500,000 | 32 MiB | 52,635 | 74.05 / 564.41 ms | 0 | 191.44 MiB | 130.02% |
 
-Both runs completed ramp, hold, and drain without errors or OOM. Each used a
-60-second nominal user hold; initial user think time left about 54 and 51
-seconds sampled at the full TCP count. CPU, memory, and I/O profilers were on.
+All runs completed ramp, hold, and drain without errors or OOM. Each used a
+60-second nominal user hold; initial user think time delays reaching the full
+TCP count. CPU, memory, and I/O profilers were on.
 The application cgroup limit was 2,147,483,648 bytes, including kernel memory,
 socket buffers, and file cache. These measurements do not establish the
 five-minute, whole-system 2 GB / one-vCPU contest result. In particular, the
-450,000-connection run used more than one core while profiled, and enforcement
+450,000- and 500,000-connection runs used more than one core while profiled, and enforcement
 of the configured CPU quota was not verified.
