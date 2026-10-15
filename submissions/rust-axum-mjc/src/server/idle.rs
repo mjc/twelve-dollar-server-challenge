@@ -26,6 +26,9 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 
+const IDLE_READY_BATCH: usize = 1024;
+const MAX_ACTIVE_CONNECTIONS: usize = 8192;
+
 struct IdleConnection<S> {
     stream: TcpStream,
     service: S,
@@ -170,7 +173,7 @@ where
     let mut builder = http1::Builder::new();
     builder.header_read_timeout(None).writev(false);
     let mut idle = IdleSockets::new()?;
-    let mut events = Events::with_capacity(1024);
+    let mut events = Events::with_capacity(IDLE_READY_BATCH);
     let mut active = JoinSet::new();
     let (stop, _) = watch::channel(false);
     let mut report = tokio::time::interval(Duration::from_secs(1));
@@ -202,7 +205,12 @@ where
                     accept_after = Instant::now() + Duration::from_secs(1);
                 },
             },
-            readiness = idle.ready(&mut events) => {
+            // Leave unread sockets in epoll when active work fills the budget.
+            // Reserve room for the entire returned batch before polling: no
+            // readiness event is consumed without space for its HTTP task.
+            // Completed tasks remain counted until join_next releases them.
+            readiness = idle.ready(&mut events),
+                if active.len() <= MAX_ACTIVE_CONNECTIONS - IDLE_READY_BATCH => {
                 let elapsed = match readiness {
                     Ok(elapsed) => elapsed,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -241,6 +249,7 @@ where
                         "end_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
                         "interval_us": report_at.elapsed().as_micros(),
                         "idle": idle.connections.len(), "active": active.len(),
+                        "active_limit": MAX_ACTIVE_CONNECTIONS,
                         "idle_capacity": idle.connections.capacity(),
                         "accepted": accepted_count, "completed": completed_count, "ready": ready_count,
                         "readiness_us": scan_us, "max_readiness_us": max_scan_us,
