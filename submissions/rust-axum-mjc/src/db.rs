@@ -38,7 +38,8 @@ ORDER BY f.created_at DESC, f.id DESC";
 const CREATE_POST_QUERY: &str =
     "INSERT INTO posts (user_id, body) VALUES (?1, ?2) RETURNING id, created_at";
 const POST_EXISTS_QUERY: &str = "SELECT EXISTS (SELECT 1 FROM posts WHERE id = ?1)";
-const INSERT_LIKE_QUERY: &str = "INSERT INTO likes (user_id, post_id) SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM posts WHERE id = ?2) ON CONFLICT (user_id, post_id) DO NOTHING";
+const INSERT_LIKE_QUERY: &str = "INSERT INTO likes (user_id, post_id) VALUES (?1, ?2) ON CONFLICT (user_id, post_id) DO NOTHING";
+const PAGE_CACHE_KIB: i64 = 256 * 1024;
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
 const STORAGE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const STORAGE_BUDGET_BYTES: u64 = 40 * 1024 * 1024 * 1024;
@@ -1065,6 +1066,7 @@ impl Db {
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "wal_autocheckpoint", 0)?;
+        connection.pragma_update(None, "cache_size", -PAGE_CACHE_KIB)?;
         let effective_mmap_size = configure_mmap_size(&connection, mmap_size_bytes)?;
         let checkpoint_connection = Connection::open_with_flags(
             path,
@@ -1083,7 +1085,7 @@ impl Db {
             );
         }
         eprintln!(
-            "SQLite mmap_size requested={mmap_size_bytes} bytes effective={effective_mmap_size} bytes wal_autocheckpoint=0 checkpoint_mode=background_passive checkpoint_retry_seconds={} storage_sample_seconds={} storage_budget_bytes={} checkpoint_soft_bytes={} write_reject_bytes={} write_resume_bytes={}",
+            "SQLite mmap_size requested={mmap_size_bytes} bytes effective={effective_mmap_size} bytes page_cache_target_kib={PAGE_CACHE_KIB} wal_autocheckpoint=0 checkpoint_mode=background_passive checkpoint_retry_seconds={} storage_sample_seconds={} storage_budget_bytes={} checkpoint_soft_bytes={} write_reject_bytes={} write_resume_bytes={}",
             CHECKPOINT_INTERVAL.as_secs(),
             STORAGE_SAMPLE_INTERVAL.as_secs(),
             STORAGE_BUDGET_BYTES,
@@ -1405,13 +1407,28 @@ fn insert_like(
     user_id: i64,
     post_id: i64,
 ) -> Result<Option<bool>, DbError> {
-    let inserted = insert_statement.execute(params![user_id, post_id])?;
+    let inserted = match insert_statement.execute(params![user_id, post_id]) {
+        Ok(inserted) => inserted,
+        Err(error) => {
+            // Let SQLite's foreign key check handle successful inserts. Only
+            // classify a missing post after failure; invalid users stay errors.
+            if error.sqlite_error().is_some_and(|error| {
+                error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
+            }) {
+                let exists: bool = exists_statement.query_row([post_id], |row| row.get(0))?;
+                if !exists {
+                    return Ok(None);
+                }
+            }
+            return Err(error.into());
+        }
+    };
     if inserted != 0 {
         return Ok(Some(false));
     }
 
-    // A no-op insert is either a duplicate like or a missing post. Probe only
-    // this cold branch to preserve the 404 distinction.
+    // A no-op insert normally means a duplicate. Check the post so pre-existing
+    // orphan likes still return 404.
     let exists: bool = exists_statement.query_row([post_id], |row| row.get(0))?;
     if !exists {
         return Ok(None);
