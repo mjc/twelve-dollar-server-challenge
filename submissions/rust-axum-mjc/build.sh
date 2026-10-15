@@ -2,9 +2,6 @@
 set -euo pipefail
 HERE="$(cd -- "$(dirname -- "$0")" && pwd)"
 cd "$HERE"
-if [[ -f /etc/NIXOS && "${DEVENV_ROOT:-}" != "$HERE" ]]; then
-  exec devenv shell bash "$HERE/build.sh"
-fi
 if [[ -d /opt/rust-1.99.0 ]]; then
   export PATH="/opt/rust-1.99.0/bin:/opt/mold-3.0.0/bin:$PATH"
   export MOLD_LIBDIR=/opt/mold-3.0.0/lib/mold
