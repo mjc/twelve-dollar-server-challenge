@@ -676,7 +676,10 @@ fn process_read_batch(
     len: usize,
     feed_capacity: &mut usize,
     post_capacity: &mut usize,
+    completed: &mut [Option<ReadCompletion>; READ_BATCH_LIMIT],
 ) -> bool {
+    let completed = &mut completed[..len];
+    debug_assert!(completed.iter().all(Option::is_none));
     let transaction = match ReadBatchTransaction::begin(
         connection,
         &mut statements.begin_read,
@@ -694,7 +697,6 @@ fn process_read_batch(
         }
     };
 
-    let mut completed: [Option<ReadCompletion>; READ_BATCH_LIMIT] = std::array::from_fn(|_| None);
     for index in 0..len {
         let Some(request) = batch[index].take() else {
             continue;
@@ -729,7 +731,7 @@ fn process_read_batch(
             completion.fail(&message);
         }
     }
-    for completion in completed.into_iter().flatten() {
+    for completion in completed.iter_mut().filter_map(Option::take) {
         completion.send();
     }
     connection.is_autocommit()
@@ -834,9 +836,12 @@ fn process_write_batch(
     batch: &mut [Option<Request>],
     capacities: WriteBatchCapacities<'_>,
     timings_enabled: bool,
+    completed: &mut [Option<WriteCompletion>; WRITE_BATCH_LIMIT],
 ) -> bool {
     let len = batch.len();
     assert!(len <= WRITE_BATCH_LIMIT);
+    let completed = &mut completed[..len];
+    debug_assert!(completed.iter().all(Option::is_none));
     if batch.iter().flatten().all(Request::reply_closed) {
         for slot in batch.iter_mut() {
             drop(slot.take());
@@ -844,7 +849,6 @@ fn process_write_batch(
         return connection.is_autocommit();
     }
 
-    let mut completed: [Option<WriteCompletion>; WRITE_BATCH_LIMIT] = std::array::from_fn(|_| None);
     let begin_result = statements.begin_write.execute([]);
     if let Err(error) = begin_result {
         let message = format!("begin failed: {error}");
@@ -855,7 +859,7 @@ fn process_write_batch(
                 completed[index] = Some(fail_write_request(request, &message));
             }
         }
-        for completion in completed.into_iter().flatten() {
+        for completion in completed.iter_mut().filter_map(Option::take) {
             completion.send();
         }
         return connection.is_autocommit();
@@ -979,7 +983,7 @@ fn process_write_batch(
             }
         }
     }
-    for completion in completed.into_iter().flatten() {
+    for completion in completed.iter_mut().filter_map(Option::take) {
         completion.send();
     }
     connection.is_autocommit()
@@ -1120,6 +1124,10 @@ impl Db {
                 let mut pending = None;
                 let mut read_batch: [Option<Request>; READ_BATCH_LIMIT] =
                     std::array::from_fn(|_| None);
+                // Retain empty reply slots across batches. Only the current
+                // batch's prefix is visited; sending takes every occupied slot.
+                let mut read_completed = std::array::from_fn(|_| None);
+                let mut write_completed = std::array::from_fn(|_| None);
                 while let Some(request) = pending.take().or_else(|| receiver.blocking_recv()) {
                     // The handler may have been cancelled while this request
                     // waited in the queue. Avoid its SQL and release its slot.
@@ -1147,6 +1155,7 @@ impl Db {
                                 batch_len,
                                 &mut feed_capacity,
                                 &mut post_capacity,
+                                &mut read_completed,
                             );
                             if !connection_usable {
                                 break;
@@ -1204,6 +1213,7 @@ impl Db {
                         &mut write_batch[..batch_len],
                         capacities,
                         worker_sqlite_timings,
+                        &mut write_completed,
                     );
                     if let (Some(timings), Some(started), Some(collected)) =
                         (&mut timings, batch_started, collected)
@@ -2067,7 +2077,8 @@ mod tests {
                 post: &mut post_capacity,
                 created_post: &mut created_post_capacity,
             },
-            false
+            false,
+            &mut std::array::from_fn(|_| None),
         ));
         assert_eq!(
             json(first_response.blocking_recv().unwrap().unwrap())["post"]["body"],
@@ -2118,7 +2129,8 @@ mod tests {
                 post: &mut post_capacity,
                 created_post: &mut created_post_capacity,
             },
-            false
+            false,
+            &mut std::array::from_fn(|_| None),
         ));
         assert!(
             matches!(response.blocking_recv().unwrap(), Err(DbError::WriteBatch(message)) if message.starts_with("commit failed:"))
@@ -2198,6 +2210,7 @@ mod tests {
             3,
             &mut feed_capacity,
             &mut post_capacity,
+            &mut std::array::from_fn(|_| None),
         ));
 
         assert!(matches!(
@@ -2232,6 +2245,7 @@ mod tests {
             2,
             &mut feed_capacity,
             &mut post_capacity,
+            &mut std::array::from_fn(|_| None),
         );
 
         for response in [first_response, second_response] {
@@ -2291,6 +2305,7 @@ mod tests {
             2,
             &mut feed_capacity,
             &mut post_capacity,
+            &mut std::array::from_fn(|_| None),
         );
 
         for response in [first_response, second_response] {
@@ -2326,6 +2341,7 @@ mod tests {
             1,
             &mut feed_capacity,
             &mut post_capacity,
+            &mut std::array::from_fn(|_| None),
         );
 
         let Err(DbError::ReadBatch(message)) = response.blocking_recv().unwrap() else {
