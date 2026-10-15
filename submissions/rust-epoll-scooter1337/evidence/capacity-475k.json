@@ -1,0 +1,149 @@
+{
+  "binary_sha256": "77412ab79a14ee3a03b9d4d50173f58397e1be5bcb986caca278daa9a0dcfb2d",
+  "settings": "Frozen77412ab7/header24/cache256/mmap0/SQLworker/CQ32/retry1/wait25/inputfloor256/idlePASSIVE, fresh supplied seed; unbenchmarked cf00c3b and cache32 excluded. No source/rebuild/schema/query-result-cache/host changes.",
+  "measurement": {
+    "workload": {
+      "users": 475000,
+      "ramp_s": 60,
+      "nominal_hold_s": 75,
+      "ramp_down_s": 30,
+      "grace_s": 10,
+      "generator": "Preserved5adb/observer27b, uncapped; generator chat sole load andffmpeg toggle owner",
+      "timestamps_UTC": {
+        "started_at": "2026-10-15T16:16:56.903283816Z",
+        "hold_started_at": "2026-10-15T16:17:56.903930540Z",
+        "hold_finished_at": "2026-10-15T16:19:11.905586785Z",
+        "finished_at": "2026-10-15T16:19:51.953282488Z"
+      },
+      "full_TCP_first_sample_UTC": "2026-10-15T16:18:04.536827Z",
+      "full_TCP_last_sample_UTC": "2026-10-15T16:19:11.546741Z",
+      "observed_full_TCP_s": 67.009914,
+      "connections": {
+        "attempts": 475000,
+        "established": 475000,
+        "failed": 0,
+        "cancelled": 0
+      },
+      "aggregate": {
+        "avg_ms": 28.73131334512148,
+        "checks_failed": 0,
+        "errors": {
+          "counts": {},
+          "examples": [],
+          "omitted": 0
+        },
+        "failed": 0,
+        "failure_rate": 0.0,
+        "max_ms": 1510.0158640000002,
+        "med_ms": 0.523829,
+        "p95_ms": 191.47156239999964,
+        "p99_ms": 747.7995800399998,
+        "requests": 6411805
+      },
+      "hold": {
+        "memory_scope": "sampled cgroup memory.current, including descendants, socket buffers and page cache",
+        "requests_per_second": 50068.283579122035,
+        "sample_duration_s": 73.17484604,
+        "sample_finished_at": "2026-10-15T16:19:11.122813394+00:00",
+        "sample_started_at": "2026-10-15T16:17:57.947967354+00:00",
+        "sampled_peak_memory_bytes": 2147549184,
+        "service_cpu_percent": 58.65867210234583
+      }
+    },
+    "CPU": {
+      "generator_report_hold_percent_one_core": 58.65867210234583,
+      "owner_sampler_hold_percent_one_core": 58.69307088139303,
+      "owner_sampler_duration_s": 74.08538579940796,
+      "whole_run_app_percent_one_core": 46.629653667769986,
+      "scope": "Observed appthreads; profiling/BPF may be charged in app context. Actualcpu.max100000100000 configured, lavd enforcement unverified; not whole-machine1vCPU certification."
+    },
+    "SQL_and_tail": {
+      "maxima": {
+        "pending": 50419,
+        "queue_max_us": 1003614,
+        "commit_max_us": 1003326,
+        "cache_used_bytes": 65424371,
+        "cache_hits": 185843307,
+        "cache_misses": 4272
+      },
+      "last_SQL": {
+        "requests": 6411796,
+        "pending": 2,
+        "queue_max_us": 234,
+        "commit_max_us": 268,
+        "cache_used_bytes": 65424371,
+        "cache_hits": 185843307,
+        "cache_misses": 4272,
+        "ring_ns": 1792081190577551069,
+        "ring_open": 11355
+      },
+      "SQL_dirty_throttle_blocked_ns": 6832095190,
+      "longest_WAL_writes": [
+        {
+          "start_ns": 240411476168665,
+          "end_ns": 240412317020856,
+          "tid": 2087662,
+          "syscall": 18,
+          "fd": 4,
+          "length": 24,
+          "offset": 3971436952,
+          "result": 24,
+          "duration_ns": 840849321,
+          "start_utc": "2026-10-15T16:18:52.215913+00:00",
+          "relative_hold_end_s": -19.689672708511353
+        },
+        {
+          "start_ns": 240423487834672,
+          "end_ns": 240423699047863,
+          "tid": 2087662,
+          "syscall": 18,
+          "fd": 4,
+          "length": 24,
+          "offset": 4516039152,
+          "result": 24,
+          "duration_ns": 211211471,
+          "start_utc": "2026-10-15T16:19:04.227579+00:00",
+          "relative_hold_end_s": -7.678006649017334
+        },
+        {
+          "start_ns": 240444404147815,
+          "end_ns": 240444613031727,
+          "tid": 2087662,
+          "syscall": 18,
+          "fd": 4,
+          "length": 24,
+          "offset": 5467668512,
+          "result": 24,
+          "duration_ns": 208882262,
+          "start_utc": "2026-10-15T16:19:25.143893+00:00",
+          "relative_hold_end_s": 13.238306522369385
+        },
+        {
+          "start_ns": 240436216047514,
+          "end_ns": 240436424017297,
+          "tid": 2087662,
+          "syscall": 18,
+          "fd": 4,
+          "length": 24,
+          "offset": 5109434512,
+          "result": 24,
+          "duration_ns": 207968123,
+          "start_utc": "2026-10-15T16:19:16.955792+00:00",
+          "relative_hold_end_s": 5.050206184387207
+        }
+      ],
+      "first_checkpoint_UTC": "2026-10-15T16:19:53.682062+00:00",
+      "WAL_frames": 1466523,
+      "WAL_bytes": 6042074792,
+      "explanation": "Largest840.849ms WALpwrite starts16:18:52.216Z during full hold; blocked stacks show SQLbalance_dirty_pages. COMMIT max1.003326s/queue1.003614s, pendingmax50419; noSQLinputwaiters or ENOBUFS. Firstcheckpoint16:19:53.682 after workloadfinish16:19:51.953. Remaining tail includes SQLwriteback/queue stalls; original generator has no matched-request tracing, so no per-request attribution claimed."
+    },
+    "artifacts": {
+      "generator": "/home/mjc/projects/twelve-dollar-benchmark-no-goose/results/tali-scooter-frozen-header24-cache256-475000-20261015T161626Z/run",
+      "profile": "/home/mjc/projects/twelve-dollar-benchmark-no-goose/results/tali-scooter-frozen-header24-cache256-475000-20261015T161626Z/profile",
+      "remote_profile": "/home/mjc/bench/scooter-pr82-63eeda66/profiles/475k-20261015T161528Z"
+    },
+    "comparison_limits": "475k instead of500k and75s nominalhold instead of60; no isolated code/performance improvement claim. Above500k is not the current task."
+  },
+  "original_evidence_commit": "c52fa1f5b4b1434d1b46d195e1420dce9135d657",
+  "rewrite_note": "Condensed original evidence; original author identity/date preserved. Full original signed history and artifacts remain backed up."
+}
