@@ -1,0 +1,113 @@
+{
+  "control_commit": "c509cdc",
+  "control_binary_sha256": "16814375ebcddf6497eb8fe84e4852548ee4edceb110a2e5958b0db0eb9eef45",
+  "candidate_binary_sha256": "3806c6d16ee9aca73cd6b36d8ebc668aa9e2d670e6e97499d264b090ef8ec787",
+  "candidate_patch_sha256": "f898a9b6ff4d07bc1b005fa68be03a2f818710024db0e0ae4cf36bca1278e183",
+  "factor": "32 immediate jobs ->1024 jobs/one fixed1ms collection deadline; cumulative diagnostics added. Query/cache256/mmap0/admission/allocator/tenports/worker/errorpolicy/seed unchanged.",
+  "workload": "475000 VUs;60ramp/75hold/30drain/10grace; original5adb27b,ffmpegpausedbygeneratorowner",
+  "aggregate": {
+    "avg_ms": 15.952459926330619,
+    "checks_failed": 0,
+    "errors": {
+      "counts": {},
+      "examples": [],
+      "omitted": 0
+    },
+    "failed": 0,
+    "failure_rate": 0.0,
+    "max_ms": 942.3392630000001,
+    "med_ms": 1.8861940000000001,
+    "p95_ms": 3.1475159999999884,
+    "p99_ms": 578.6758816999996,
+    "requests": 6421655
+  },
+  "hold": {
+    "memory_scope": "sampled cgroup memory.current, including descendants, socket buffers and page cache",
+    "requests_per_second": 50146.67914935702,
+    "sample_duration_s": 73.265521278,
+    "sample_finished_at": "2026-10-15T17:49:00.554316120+00:00",
+    "sample_started_at": "2026-10-15T17:47:47.288794842+00:00",
+    "sampled_peak_memory_bytes": 2147700736,
+    "service_cpu_percent": 54.685260271301395
+  },
+  "full_TCP_window": {
+    "first_full_TCP_UTC": "2026-10-15T17:47:53.418162273+00:00",
+    "last_full_TCP_UTC": "2026-10-15T17:48:59.580729408+00:00",
+    "duration_s": 66.1625669002533,
+    "sample_rows": 35,
+    "completed_request_counter_delta": 3314836,
+    "perf_monotonic_lo": 245752.67841744423,
+    "perf_monotonic_hi": 245818.84098434448,
+    "scope": "Longest contiguous generator-sampled fullTCP segment; clock translation uses target UTC-minus-monotonic metadata."
+  },
+  "sampled_CPU_us_per_request": 11.195459063434813,
+  "batching_full_window": {
+    "requests": 3313445,
+    "batches": 36439,
+    "collection_us": 38168348,
+    "execution_us": 15069461,
+    "commit_us": 4589997,
+    "size_bins": [
+      1,
+      4,
+      60,
+      35818,
+      420,
+      136
+    ],
+    "jobs_per_batch": 90.93128241719037,
+    "counter_window_s": 66.00108671188354
+  },
+  "before_after": {
+    "hold_CPU_percent_one_core": [
+      59.5553786270056,
+      54.685260271301395
+    ],
+    "p50_ms": [
+      0.512719,
+      1.8861940000000001
+    ],
+    "p95_ms": [
+      1.139423,
+      3.1475159999999884
+    ],
+    "p99_ms": [
+      472.2951888,
+      578.6758816999996
+    ],
+    "app_peak_RSS_bytes": [
+      106672128,
+      115564544
+    ],
+    "WAL_bytes_first_postload_checkpoint": [
+      6079266032,
+      5007551032
+    ],
+    "whole_run_completed_batches": [
+      857430,
+      105437
+    ]
+  },
+  "storage_limits": {
+    "max_COMMIT_us": 847126,
+    "pending_max": 38203,
+    "max_batch_reserved_reply_bytes": 2448896,
+    "dirty_throttle_blocked_ns": 3619665318,
+    "first_checkpoint_UTC": "2026-10-15T17:49:42.932738+00:00"
+  },
+  "checks": {
+    "unit_passed": 14,
+    "unit_ignored": 2,
+    "API_passed": 42,
+    "feed_checks_passed": 6,
+    "seeded_transaction_passed": 1
+  },
+  "artifacts": "/home/mjc/projects/twelve-dollar-benchmark-no-goose/results/tali-scooter-coalesce1024-fixed1ms-475000-20261015T174625Z",
+  "caveats": [
+    "CPU improvement with explicit latency/RSS cost; no claim of uniformly better performance.",
+    "Larger groups do not fix dirty-WAL stalls; no traffic checkpoint, no request-result cache.",
+    "Sample proportions/counter windows approximate; app2GiB/lavdquota not whole-systemcertification.",
+    "Separate audit tracks rollback-failure/graceful-shutdown gaps; this collection patch does not fix them."
+  ],
+  "cleanup": "Appand5ownerrecorders identityverifiedstopped;generator/sampler/observercomplete/Workersrunning;READYinvalidated/ownershipreleased."
+}
