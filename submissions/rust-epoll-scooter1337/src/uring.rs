@@ -28,6 +28,7 @@ const ACCEPT: u64 = 1;
 const RECV: u64 = 2;
 const SEND: u64 = 3;
 const IGNORE: u64 = 4;
+const SHUTDOWN: u64 = 5;
 const LIVE: u32 = 1;
 const RECEIVING: u32 = 2;
 const SENDING: u32 = 4;
@@ -37,6 +38,7 @@ const PAUSED: u32 = 32;
 const DIRTY: u32 = 64;
 const CONTINUED: u32 = 128;
 const READY: u32 = 256;
+const SHUT_PENDING: u32 = 512;
 const REARM: u32 = 1024;
 const INDEX_SHIFT: u32 = 11;
 const FLAG_MASK: u32 = (1 << INDEX_SHIFT) - 1;
@@ -474,21 +476,44 @@ impl Worker {
             self.queue(e);
         }
     }
+    fn shutdown(&mut self, fd: usize) {
+        let c = &mut self.clients[fd];
+        if c.state & SHUT != 0 {
+            return;
+        }
+        c.state |= SHUT | SHUT_PENDING;
+        // Shutdown runs in io-wq and resolves its fixed slot there. Keep that
+        // slot occupied until its CQE, even if recv reaches EOF first.
+        let entry = opcode::Shutdown::new(types::Fixed(fd as u32), libc::SHUT_RDWR)
+            .build()
+            .user_data(tag(SHUTDOWN, fd, c.generation));
+        self.queue(entry);
+    }
+    fn on_shutdown(&mut self, fd: usize, generation: u32, result: i32) {
+        if fd >= self.clients.len()
+            || self.clients[fd].generation != generation
+            || self.clients[fd].state & LIVE == 0
+        {
+            return;
+        }
+        self.clients[fd].state &= !SHUT_PENDING;
+        if result < 0 && self.clients[fd].state & RECEIVING != 0 {
+            self.queue(
+                opcode::AsyncCancel::new(tag(RECV, fd, generation))
+                    .build()
+                    .user_data(IGNORE)
+                    .flags(squeue::Flags::SKIP_SUCCESS),
+            );
+        }
+        self.close(fd);
+    }
     fn close(&mut self, fd: usize) {
         let c = &mut self.clients[fd];
-        if c.state & LIVE == 0 || c.state & SENDING != 0 || c.output.len != 0 {
+        if c.state & LIVE == 0 || c.state & (SENDING | SHUT_PENDING) != 0 || c.output.len != 0 {
             return;
         }
         if c.state & RECEIVING != 0 {
-            if c.state & SHUT == 0 {
-                c.state |= SHUT;
-                self.queue(
-                    opcode::Shutdown::new(types::Fixed(fd as u32), libc::SHUT_RDWR)
-                        .build()
-                        .user_data(IGNORE)
-                        .flags(squeue::Flags::SKIP_SUCCESS),
-                );
-            }
+            self.shutdown(fd);
             return;
         }
         self.queue(
@@ -881,6 +906,7 @@ impl Worker {
                     ACCEPT => self.on_accept(fd, generation, result, flags),
                     RECV => self.on_recv(fd, generation, result, flags, &mut app),
                     SEND => self.on_send(fd, generation, result),
+                    SHUTDOWN => self.on_shutdown(fd, generation, result),
                     _ => {}
                 }
             }
@@ -944,15 +970,7 @@ impl Worker {
                     {
                         c.state |= CLOSING;
                         c.output.len = 0;
-                        if c.state & SHUT == 0 {
-                            c.state |= SHUT;
-                            self.queue(
-                                opcode::Shutdown::new(types::Fixed(fd as u32), libc::SHUT_RDWR)
-                                    .build()
-                                    .user_data(IGNORE)
-                                    .flags(squeue::Flags::SKIP_SUCCESS),
-                            );
-                        }
+                        self.shutdown(fd);
                         self.close(fd);
                     }
                 }
@@ -993,6 +1011,131 @@ fn listen_addresses(address: &str) -> io::Result<Vec<String>> {
     Ok((first..=last)
         .map(|port| format!("{host}:{port}"))
         .collect())
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::{
+        ffi::CString,
+        io::Read,
+        os::unix::{fs::OpenOptionsExt, net::UnixStream},
+    };
+
+    #[test]
+    fn fixed_slot_waits_for_shutdown_even_when_receive_finishes_first() {
+        let fifo =
+            std::env::temp_dir().join(format!("scooter-shutdown-{}.fifo", std::process::id()));
+        let name = CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: live NUL-terminated path; the unique test owns this FIFO.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (old, mut old_peer) = UnixStream::pair().unwrap();
+        let (new, mut new_peer) = UnixStream::pair().unwrap();
+        let mut w = Worker::new(Vec::new(), 4096, Tuning::default()).unwrap();
+        w.ring
+            .submitter()
+            .register_iowq_max_workers(&mut [1, 1])
+            .unwrap();
+        w.ring
+            .submitter()
+            .register_files_update(0, &[old.as_raw_fd()])
+            .unwrap();
+        w.clients.push(Client {
+            state: LIVE | RECEIVING | CLOSING,
+            ..Client::default()
+        });
+        w.open = 1;
+        // Hold the worker so receive EOF can precede queued shutdown execution.
+        // name remains live until the OpenAt completion has been consumed.
+        w.queue(
+            opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), name.as_ptr())
+                .flags(libc::O_RDONLY)
+                .build()
+                .flags(squeue::Flags::ASYNC)
+                .user_data(IGNORE),
+        );
+        w.ring.submit().unwrap();
+        let mut blocked = false;
+        for _ in 0..100 {
+            for task in std::fs::read_dir("/proc/self/task").unwrap() {
+                let p = task.unwrap().path();
+                let comm = std::fs::read_to_string(p.join("comm")).unwrap_or_default();
+                let wait = std::fs::read_to_string(p.join("wchan")).unwrap_or_default();
+                blocked |= comm.starts_with("iou-wrk") && wait.contains("wait_for_partner");
+            }
+            if blocked {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        w.close(0);
+        w.ring.submit().unwrap();
+        // on_recv clears RECEIVING on its final CQE before calling close.
+        w.clients[0].state &= !RECEIVING;
+        w.close(0);
+        let retired_early = w.clients[0].state & LIVE == 0;
+        w.ring.submit().unwrap();
+        if retired_early {
+            w.ring
+                .submitter()
+                .register_files_update(0, &[new.as_raw_fd()])
+                .unwrap();
+        }
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        let mut completed = 0;
+        while completed < 2 {
+            w.ring.submit_and_wait(1).unwrap();
+            let cqes: Vec<_> = w
+                .ring
+                .completion()
+                .map(|c| (c.user_data(), c.result()))
+                .collect();
+            for (tag, result) in cqes {
+                assert!(result >= 0, "completion {tag}: {result}");
+                if tag & 255 == SHUTDOWN {
+                    w.on_shutdown(0, 0, result);
+                } else {
+                    // SAFETY: OpenAt transferred this ordinary owned descriptor.
+                    unsafe {
+                        libc::close(result);
+                    }
+                }
+                completed += 1;
+            }
+        }
+        w.ring.submit().unwrap();
+        if !retired_early {
+            w.ring
+                .submitter()
+                .register_files_update(0, &[new.as_raw_fd()])
+                .unwrap();
+        }
+        old_peer
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        new_peer
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let old_read = old_peer.read(&mut [0u8; 1]);
+        let new_read = new_peer.read(&mut [0u8; 1]);
+        drop(writer);
+        std::fs::remove_file(fifo).unwrap();
+        assert!(blocked, "worker was not held");
+        assert!(
+            !retired_early,
+            "slot retired while shutdown still used its index"
+        );
+        assert!(matches!(old_read, Ok(0)), "old socket: {old_read:?}");
+        assert!(
+            matches!(new_read, Err(ref e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)),
+            "new socket: {new_read:?}"
+        );
+        assert_eq!(w.open, 0);
+    }
 }
 
 #[cfg(test)]
