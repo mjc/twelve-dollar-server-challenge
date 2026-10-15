@@ -228,6 +228,19 @@ new run started from a clean VM. The earlier errors coincided with I/O wait
 during ramp, so this comparison does not establish that the storage stall is
 fixed. These one-minute holds do not establish the five-minute contest result.
 
+Continuing that build in 5,000-user steps produced:
+
+| Users | Result | p95 / p99 | HTTP errors | Hold whole-VM CPU |
+| --- | --- | ---: | ---: | ---: |
+| 170,000 | Pass | 476.42 / 537.59 ms | 0 | 92.35% |
+| 175,000 | Fail: p95 above 500 ms | 553.64 / 727.06 ms | 0 | 92.44% |
+
+The observer used about 28% of the VM's only CPU in both runs, already included
+in the whole-VM totals. Each census dumped the socket table and resolved every
+process descriptor, taking about 645 ms of CPU per cycle at 175,000 users.
+These results include that measurement overhead; an observer-only repeat with
+the unchanged server is needed to establish its effect on latency.
+
 ### Earlier capacity measurements
 
 The same optimized binary and ten listeners produced:
