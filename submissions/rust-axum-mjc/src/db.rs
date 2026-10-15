@@ -1,12 +1,11 @@
 use std::{
     error::Error,
-    ffi::OsString,
     fmt,
-    path::{Path, PathBuf},
+    path::Path,
     sync::mpsc as std_mpsc,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -39,29 +38,8 @@ const CREATE_POST_QUERY: &str =
     "INSERT INTO posts (user_id, body) VALUES (?1, ?2) RETURNING id, created_at";
 const POST_EXISTS_QUERY: &str = "SELECT EXISTS (SELECT 1 FROM posts WHERE id = ?1)";
 const INSERT_LIKE_QUERY: &str = "INSERT INTO likes (user_id, post_id) VALUES (?1, ?2) ON CONFLICT (user_id, post_id) DO NOTHING";
-const PAGE_CACHE_KIB: i64 = 256 * 1024;
-const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
-const STORAGE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-const STORAGE_BUDGET_BYTES: u64 = 40 * 1024 * 1024 * 1024;
-const CHECKPOINT_SOFT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
-const WRITE_REJECT_BYTES: u64 = 39 * 1024 * 1024 * 1024;
-const WRITE_RESUME_BYTES: u64 = 38 * 1024 * 1024 * 1024;
-#[derive(Clone, Copy)]
-struct StoragePolicy {
-    sample_interval: Duration,
-    checkpoint_interval: Duration,
-    soft_bytes: u64,
-    reject_bytes: u64,
-    resume_bytes: u64,
-}
-
-const STORAGE_POLICY: StoragePolicy = StoragePolicy {
-    sample_interval: STORAGE_SAMPLE_INTERVAL,
-    checkpoint_interval: CHECKPOINT_INTERVAL,
-    soft_bytes: CHECKPOINT_SOFT_BYTES,
-    reject_bytes: WRITE_REJECT_BYTES,
-    resume_bytes: WRITE_RESUME_BYTES,
-};
+pub const DEFAULT_PAGE_CACHE_KIB: u64 = 256 * 1024;
+const CHECKPOINT_IDLE_INTERVAL: Duration = Duration::from_secs(1);
 const REQUEST_CAPACITY: usize = 4096;
 // Match the benchmark p99 ceiling; admission and execution both count toward latency.
 const REQUEST_ADMISSION_TIMEOUT: Duration = Duration::from_secs(1);
@@ -78,7 +56,160 @@ fn sqlite_timings_enabled() -> bool {
     })
 }
 
-fn log_slow_commit(enabled: bool, started: Option<Instant>) {
+#[derive(Default)]
+struct AdmissionTimings {
+    completed: AtomicU64,
+    read_timeouts: AtomicU64,
+    write_timeouts: AtomicU64,
+    wait_us: AtomicU64,
+    max_wait_us: AtomicU64,
+    last_report_ms: AtomicU64,
+}
+
+impl AdmissionTimings {
+    fn record(&self, started: Instant, write: bool, timed_out: bool, available_slots: usize) {
+        let wait_us = started.elapsed().as_micros() as u64;
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        self.wait_us.fetch_add(wait_us, Ordering::Relaxed);
+        self.max_wait_us.fetch_max(wait_us, Ordering::Relaxed);
+        if timed_out {
+            let timeouts = if write {
+                &self.write_timeouts
+            } else {
+                &self.read_timeouts
+            };
+            timeouts.fetch_add(1, Ordering::Relaxed);
+        }
+        let now_ms = unix_ms();
+        let last_report = self.last_report_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last_report) >= 1_000
+            && self
+                .last_report_ms
+                .compare_exchange(last_report, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.report(false, Some(available_slots));
+        }
+    }
+
+    fn report(&self, final_report: bool, available_slots: Option<usize>) {
+        // Cumulative counters; producers still report when the worker is blocked.
+        eprintln!(
+            "SQLITE_TIMING {}",
+            serde_json::json!({
+                "event": "queue_admission", "end_unix_ms": unix_ms(), "final": final_report,
+                "completed": self.completed.load(Ordering::Relaxed),
+                "read_timeouts": self.read_timeouts.load(Ordering::Relaxed),
+                "write_timeouts": self.write_timeouts.load(Ordering::Relaxed),
+                "wait_us": self.wait_us.load(Ordering::Relaxed),
+                "max_wait_us": self.max_wait_us.load(Ordering::Relaxed),
+                "available_slots": available_slots,
+            })
+        );
+    }
+}
+
+impl Drop for AdmissionTimings {
+    fn drop(&mut self) {
+        if self.completed.load(Ordering::Relaxed) != 0 {
+            self.report(true, None);
+        }
+    }
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+#[derive(Default, serde::Serialize)]
+struct BatchTotals {
+    batches: u64,
+    requests: usize,
+    max_requests: usize,
+    collection_us: u128,
+    execution_us: u128,
+    max_execution_us: u128,
+}
+
+struct WorkerTimings {
+    last_report: Instant,
+    read: BatchTotals,
+    write: BatchTotals,
+}
+
+impl WorkerTimings {
+    fn new() -> Self {
+        Self {
+            last_report: Instant::now(),
+            read: BatchTotals::default(),
+            write: BatchTotals::default(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        write: bool,
+        requests: usize,
+        started: Instant,
+        collected: Instant,
+        queued: usize,
+    ) {
+        let collection_us = collected.duration_since(started).as_micros();
+        let execution_us = collected.elapsed().as_micros();
+        let totals = if write {
+            &mut self.write
+        } else {
+            &mut self.read
+        };
+        totals.batches += 1;
+        totals.requests += requests;
+        totals.max_requests = totals.max_requests.max(requests);
+        totals.collection_us += collection_us;
+        totals.execution_us += execution_us;
+        totals.max_execution_us = totals.max_execution_us.max(execution_us);
+        if execution_us >= 10_000 {
+            let end_ms = unix_ms();
+            eprintln!(
+                "SQLITE_TIMING {}",
+                serde_json::json!({
+                    "event": "slow_batch", "kind": if write { "write" } else { "read" },
+                    "requests": requests, "collection_us": collection_us, "execution_us": execution_us,
+                    "start_unix_ms": end_ms.saturating_sub(((collection_us + execution_us) / 1_000) as u64),
+                    "end_unix_ms": end_ms, "queued_after": queued,
+                })
+            );
+        }
+        if self.last_report.elapsed() >= Duration::from_secs(1) {
+            self.report(false, Some(queued));
+            self.read = BatchTotals::default();
+            self.write = BatchTotals::default();
+            self.last_report = Instant::now();
+        }
+    }
+
+    fn report(&self, final_report: bool, queued: Option<usize>) {
+        eprintln!(
+            "SQLITE_TIMING {}",
+            serde_json::json!({
+                "event": "worker_batches", "end_unix_ms": unix_ms(), "final": final_report,
+                "interval_us": self.last_report.elapsed().as_micros(),
+                "read": self.read, "write": self.write, "queued_after": queued,
+            })
+        );
+    }
+}
+
+impl Drop for WorkerTimings {
+    fn drop(&mut self) {
+        if self.read.batches != 0 || self.write.batches != 0 {
+            self.report(true, None);
+        }
+    }
+}
+
+fn log_slow_commit(enabled: bool, started: Option<Instant>, requests: usize) {
     let Some(started) = started.filter(|_| enabled) else {
         return;
     };
@@ -86,16 +217,13 @@ fn log_slow_commit(enabled: bool, started: Option<Instant>) {
     if commit_us < 1_000 {
         return;
     }
-    let end_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis());
-    // Wall timestamps are approximate to the nearest millisecond; the monotonic
-    // duration remains the precise measurement used to derive the start.
+    let end_unix_ms = unix_ms();
     eprintln!(
         "SQLITE_TIMING {}",
         serde_json::json!({
             "event": "worker_commit",
-            "start_unix_ms": end_unix_ms.saturating_sub(commit_us / 1_000),
+            "requests": requests,
+            "start_unix_ms": end_unix_ms.saturating_sub((commit_us / 1_000) as u64),
             "end_unix_ms": end_unix_ms,
             "commit_us": commit_us,
             "timestamp_resolution_ms": 1,
@@ -104,63 +232,44 @@ fn log_slow_commit(enabled: bool, started: Option<Instant>) {
     );
 }
 
+// Odd generations mean SQL work is active. An unchanged even generation over
+// two samples means no batch ran during that interval.
+struct WorkerActivity<'a>(&'a AtomicU64);
+
+impl Drop for WorkerActivity<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Release);
+    }
+}
+
 fn checkpoint_worker(
     connection: Connection,
     stop: std_mpsc::Receiver<()>,
-    database_path: PathBuf,
-    write_admission_closed: Arc<AtomicBool>,
-    policy: StoragePolicy,
+    activity: Arc<AtomicU64>,
     timings_enabled: bool,
 ) {
-    let mut last_checkpoint = None;
-    let mut checkpoint_was_eligible = false;
-    let mut last_sample_error: Option<String> = None;
+    let mut previous = None;
+    let mut caught_up_at = None;
     loop {
-        match stop.recv_timeout(policy.sample_interval) {
+        match stop.recv_timeout(CHECKPOINT_IDLE_INTERVAL) {
             Ok(()) | Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std_mpsc::RecvTimeoutError::Timeout) => {}
         }
-
-        let storage_bytes = match sqlite_storage_bytes(&database_path) {
-            Ok(bytes) => {
-                last_sample_error = None;
-                bytes
-            }
-            Err(error) => {
-                close_write_admission(&write_admission_closed, 0, "storage_sample_failed");
-                let message = error.to_string();
-                if last_sample_error.as_deref() != Some(&message) {
-                    eprintln!(
-                        "SQLITE_STORAGE_BUDGET {}",
-                        serde_json::json!({
-                            "event": "sample_error",
-                            "write_admission": "closed",
-                            "error": message,
-                        })
-                    );
-                    last_sample_error = Some(message);
-                }
-                0
-            }
-        };
-
-        if storage_bytes >= policy.reject_bytes {
-            close_write_admission(&write_admission_closed, storage_bytes, "budget_high_water");
-        }
-        let admission_closed = write_admission_closed.load(Ordering::Acquire);
-        let checkpoint_eligible = admission_closed || storage_bytes >= policy.soft_bytes;
-        let checkpoint_due = checkpoint_due(
-            checkpoint_eligible,
-            checkpoint_was_eligible,
-            last_checkpoint,
-            Instant::now(),
-            policy.checkpoint_interval,
-        );
-        checkpoint_was_eligible = checkpoint_eligible;
-        if !checkpoint_due {
+        let generation = activity.load(Ordering::Acquire);
+        let unchanged = previous.replace(generation) == Some(generation);
+        if generation & 1 != 0 || !unchanged || caught_up_at == Some(generation) {
             continue;
         }
 
+        if timings_enabled {
+            eprintln!(
+                "SQLITE_TIMING {}",
+                serde_json::json!({
+                    "event": "checkpoint_start", "kind": "idle", "mode": "PASSIVE",
+                    "start_unix_ms": unix_ms(), "activity_generation": generation,
+                })
+            );
+        }
         let started = Instant::now();
         let result = connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
             Ok((
@@ -169,128 +278,32 @@ fn checkpoint_worker(
                 row.get::<_, i64>(2)?,
             ))
         });
-        let checkpoint_elapsed_us = started.elapsed().as_micros();
-        let checkpoint_end_unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_millis());
-        last_checkpoint = Some(Instant::now());
-        let checkpoint_caught_up =
-            result
-                .as_ref()
-                .is_ok_and(|(busy, log_frames, checkpointed_frames)| {
-                    *busy == 0 && *log_frames == *checkpointed_frames
-                });
-        if admission_closed && checkpoint_caught_up {
-            match sqlite_storage_bytes(&database_path) {
-                Ok(bytes) if should_resume_write_admission(bytes, policy.resume_bytes, true) => {
-                    reopen_write_admission(&write_admission_closed, bytes);
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    let message = error.to_string();
-                    if last_sample_error.as_deref() != Some(&message) {
-                        eprintln!(
-                            "SQLITE_STORAGE_BUDGET {}",
-                            serde_json::json!({
-                                "event": "sample_error",
-                                "write_admission": "closed",
-                                "error": message,
-                            })
-                        );
-                        last_sample_error = Some(message);
-                    }
-                }
-            }
+        let elapsed_us = started.elapsed().as_micros();
+        if result
+            .as_ref()
+            .is_ok_and(|(busy, log, done)| *busy == 0 && log == done)
+        {
+            caught_up_at = Some(generation);
         }
         if timings_enabled || result.is_err() {
+            let ended = unix_ms();
             let mut event = serde_json::json!({
-                "event": "checkpoint",
-                "kind": "storage_threshold",
-                "mode": "PASSIVE",
-                "start_unix_ms": checkpoint_end_unix_ms.saturating_sub(checkpoint_elapsed_us / 1_000),
-                "end_unix_ms": checkpoint_end_unix_ms,
-                "timestamp_resolution_ms": 1,
-                "elapsed_us": checkpoint_elapsed_us,
-                "passive_us": checkpoint_elapsed_us,
-                "storage_bytes": storage_bytes,
+                "event": "checkpoint", "kind": "idle", "mode": "PASSIVE",
+                "start_unix_ms": ended.saturating_sub((elapsed_us / 1_000) as u64),
+                "end_unix_ms": ended, "elapsed_us": elapsed_us,
+                "activity_generation": generation,
+                "activity_generation_after": activity.load(Ordering::Acquire),
             });
             match result {
-                Ok((busy, log_frames, checkpointed_frames)) => {
+                Ok((busy, log, done)) => {
                     event["busy"] = serde_json::json!(busy);
-                    event["log_frames"] = serde_json::json!(log_frames);
-                    event["checkpointed_frames"] = serde_json::json!(checkpointed_frames);
-                    event["outcome"] = serde_json::json!("completed");
+                    event["log_frames"] = serde_json::json!(log);
+                    event["checkpointed_frames"] = serde_json::json!(done);
                 }
-                Err(error) => {
-                    event["outcome"] = serde_json::json!("error");
-                    event["error"] = serde_json::json!(error.to_string());
-                }
+                Err(error) => event["error"] = serde_json::json!(error.to_string()),
             }
-            eprintln!("SQLITE_TIMING {}", event);
+            eprintln!("SQLITE_TIMING {event}");
         }
-    }
-}
-
-fn checkpoint_due(
-    eligible: bool,
-    was_eligible: bool,
-    last_checkpoint: Option<Instant>,
-    now: Instant,
-    interval: Duration,
-) -> bool {
-    eligible
-        && (!was_eligible
-            || last_checkpoint.is_none_or(|last| now.duration_since(last) >= interval))
-}
-
-fn should_resume_write_admission(
-    storage_bytes: u64,
-    resume_bytes: u64,
-    checkpoint_caught_up: bool,
-) -> bool {
-    checkpoint_caught_up && storage_bytes < resume_bytes
-}
-
-fn sqlite_storage_bytes(database_path: &Path) -> std::io::Result<u64> {
-    let mut total = 0_u64;
-    for (suffix, required) in [("", true), ("-wal", false), ("-shm", false)] {
-        let mut file_name: OsString = database_path.as_os_str().to_owned();
-        file_name.push(suffix);
-        match std::fs::metadata(PathBuf::from(file_name)) {
-            Ok(metadata) => total = total.saturating_add(metadata.len()),
-            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(total)
-}
-
-fn close_write_admission(gate: &AtomicBool, storage_bytes: u64, reason: &str) {
-    if !gate.swap(true, Ordering::AcqRel) {
-        eprintln!(
-            "SQLITE_STORAGE_BUDGET {}",
-            serde_json::json!({
-                "event": "write_admission",
-                "state": "closed",
-                "reason": reason,
-                "storage_bytes": storage_bytes,
-                "budget_bytes": STORAGE_BUDGET_BYTES,
-            })
-        );
-    }
-}
-
-fn reopen_write_admission(gate: &AtomicBool, storage_bytes: u64) {
-    if gate.swap(false, Ordering::AcqRel) {
-        eprintln!(
-            "SQLITE_STORAGE_BUDGET {}",
-            serde_json::json!({
-                "event": "write_admission",
-                "state": "open",
-                "storage_bytes": storage_bytes,
-                "budget_bytes": STORAGE_BUDGET_BYTES,
-            })
-        );
     }
 }
 
@@ -320,8 +333,8 @@ pub enum DbError {
     WriteBatch(String),
     InvalidPath,
     InvalidMmapSize,
+    InvalidPageCacheSize,
     WalUnavailable,
-    StorageBudget(std::io::Error),
 }
 
 impl fmt::Display for DbError {
@@ -339,8 +352,10 @@ impl fmt::Display for DbError {
             Self::InvalidMmapSize => {
                 f.write_str("SQLite mmap size must fit in a signed 64-bit integer")
             }
+            Self::InvalidPageCacheSize => f.write_str(
+                "SQLite page cache must be positive, fit a signed 32-bit KiB setting, and cover 1 to 1,000,000,000 database pages",
+            ),
             Self::WalUnavailable => f.write_str("database did not enable WAL mode"),
-            Self::StorageBudget(error) => write!(f, "database storage size unavailable: {error}"),
         }
     }
 }
@@ -352,7 +367,6 @@ impl Error for DbError {
             Self::Serialize(error) => Some(error),
             Self::InvalidUtf8(error) => Some(error),
             Self::WorkerStart(error) => Some(error),
-            Self::StorageBudget(error) => Some(error),
             _ => None,
         }
     }
@@ -681,7 +695,6 @@ fn process_read_batch(
     };
 
     let mut completed: [Option<ReadCompletion>; READ_BATCH_LIMIT] = std::array::from_fn(|_| None);
-    let mut feed_snapshot = None;
     for index in 0..len {
         let Some(request) = batch[index].take() else {
             continue;
@@ -698,16 +711,7 @@ fn process_read_batch(
                 ReadCompletion::Health(reply, result)
             }
             Request::Feed(reply) => {
-                // This read-only transaction gives all feeds the same snapshot.
-                // Reuse successful bytes only within this batch; retry item errors.
-                let result = match feed_snapshot.and_then(|i: usize| completed[i].as_ref()) {
-                    Some(ReadCompletion::Feed(_, Ok(body))) => Ok(body.clone()),
-                    _ => read_feed(&mut statements.feed, feed_capacity),
-                };
-                if result.is_ok() {
-                    feed_snapshot = Some(index);
-                }
-                ReadCompletion::Feed(reply, result)
+                ReadCompletion::Feed(reply, read_feed(&mut statements.feed, feed_capacity))
             }
             Request::Post(id, reply) => {
                 let result = read_post(&mut statements.post, id, post_capacity);
@@ -822,7 +826,6 @@ struct WriteBatchCapacities<'a> {
     feed: &'a mut usize,
     post: &'a mut usize,
     created_post: &'a mut usize,
-    admission_closed: &'a AtomicBool,
 }
 
 fn process_write_batch(
@@ -837,29 +840,6 @@ fn process_write_batch(
     if batch.iter().flatten().all(Request::reply_closed) {
         for slot in batch.iter_mut() {
             drop(slot.take());
-        }
-        return connection.is_autocommit();
-    }
-
-    if capacities.admission_closed.load(Ordering::Acquire) {
-        for slot in batch.iter_mut() {
-            let Some(request) = slot.take() else {
-                continue;
-            };
-            if request.reply_closed() {
-                continue;
-            }
-            if request.is_read() {
-                process_single_read(
-                    connection,
-                    request,
-                    statements,
-                    &mut *capacities.feed,
-                    &mut *capacities.post,
-                );
-            } else {
-                fail_write_request_busy(request).send();
-            }
         }
         return connection.is_autocommit();
     }
@@ -890,10 +870,6 @@ fn process_write_batch(
             continue;
         }
         let is_write = !request.is_read();
-        if is_write && capacities.admission_closed.load(Ordering::Acquire) {
-            completed[index] = Some(fail_write_request_busy(request));
-            continue;
-        }
         if is_write && let Err(error) = statements.savepoint.execute([]) {
             fatal = Some(format!("savepoint failed: {error}"));
             completed[index] = Some(fail_write_request(request, fatal.as_deref().unwrap()));
@@ -980,7 +956,7 @@ fn process_write_batch(
         if let Err(error) = statements.commit_write.execute([]) {
             fatal = Some(format!("commit failed: {error}"));
         }
-        log_slow_commit(timings_enabled, commit_started);
+        log_slow_commit(timings_enabled, commit_started, len);
     }
     if let Some(message) = fatal {
         if !connection.is_autocommit()
@@ -1009,22 +985,6 @@ fn process_write_batch(
     connection.is_autocommit()
 }
 
-fn fail_write_request_busy(request: Request) -> WriteCompletion {
-    match request {
-        Request::Health(reply) => WriteCompletion::Health(reply, Err(DbError::WorkerBusy)),
-        Request::Feed(reply) => WriteCompletion::Feed(reply, Err(DbError::WorkerBusy)),
-        Request::Post(_, reply) => WriteCompletion::Post(reply, Err(DbError::WorkerBusy)),
-        Request::CreatePost { reply, .. } => WriteCompletion::CreatePost {
-            reply,
-            result: Err(DbError::WorkerBusy),
-        },
-        Request::Like { reply, .. } => WriteCompletion::Like {
-            reply,
-            result: Err(DbError::WorkerBusy),
-        },
-    }
-}
-
 fn fail_write_request(request: Request, message: &str) -> WriteCompletion {
     let error = || DbError::WriteBatch(message.to_owned());
     match request {
@@ -1046,7 +1006,7 @@ fn fail_write_request(request: Request, message: &str) -> WriteCompletion {
 pub struct Db {
     requests: mpsc::Sender<Request>,
     worker_thread: std::thread::Thread,
-    write_admission_closed: Arc<AtomicBool>,
+    admission_timings: Option<Arc<AdmissionTimings>>,
 }
 
 impl Db {
@@ -1066,6 +1026,15 @@ impl Db {
         read_batching: bool,
         mmap_size_bytes: u64,
     ) -> Result<Self, DbError> {
+        Self::open_with_page_cache(path, read_batching, mmap_size_bytes, DEFAULT_PAGE_CACHE_KIB)
+    }
+
+    pub fn open_with_page_cache(
+        path: impl AsRef<Path>,
+        read_batching: bool,
+        mmap_size_bytes: u64,
+        page_cache_kib: u64,
+    ) -> Result<Self, DbError> {
         let sqlite_timings = sqlite_timings_enabled();
         let path = path.as_ref();
         if path.as_os_str().is_empty() || path == Path::new(":memory:") {
@@ -1084,7 +1053,7 @@ impl Db {
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "wal_autocheckpoint", 0)?;
-        connection.pragma_update(None, "cache_size", -PAGE_CACHE_KIB)?;
+        configure_page_cache(&connection, page_cache_kib)?;
         let effective_mmap_size = configure_mmap_size(&connection, mmap_size_bytes)?;
         let checkpoint_connection = Connection::open_with_flags(
             path,
@@ -1093,38 +1062,22 @@ impl Db {
         checkpoint_connection.busy_timeout(Duration::ZERO)?;
         checkpoint_connection.pragma_update(None, "synchronous", "NORMAL")?;
         checkpoint_connection.pragma_update(None, "wal_autocheckpoint", 0)?;
-        let initial_storage_bytes = sqlite_storage_bytes(path).map_err(DbError::StorageBudget)?;
-        let write_admission_closed = Arc::new(AtomicBool::new(false));
-        if initial_storage_bytes >= WRITE_REJECT_BYTES {
-            close_write_admission(
-                &write_admission_closed,
-                initial_storage_bytes,
-                "startup_high_water",
-            );
-        }
         eprintln!(
-            "SQLite mmap_size requested={mmap_size_bytes} bytes effective={effective_mmap_size} bytes page_cache_target_kib={PAGE_CACHE_KIB} wal_autocheckpoint=0 checkpoint_mode=background_passive checkpoint_retry_seconds={} storage_sample_seconds={} storage_budget_bytes={} checkpoint_soft_bytes={} write_reject_bytes={} write_resume_bytes={}",
-            CHECKPOINT_INTERVAL.as_secs(),
-            STORAGE_SAMPLE_INTERVAL.as_secs(),
-            STORAGE_BUDGET_BYTES,
-            CHECKPOINT_SOFT_BYTES,
-            WRITE_REJECT_BYTES,
-            WRITE_RESUME_BYTES,
+            "SQLite mmap_size requested={mmap_size_bytes} bytes effective={effective_mmap_size} bytes page_cache_target_kib={page_cache_kib} wal_autocheckpoint=0 checkpoint_mode=background_passive_when_idle idle_sample_seconds={}",
+            CHECKPOINT_IDLE_INTERVAL.as_secs(),
         );
+        let worker_activity = Arc::new(AtomicU64::new(0));
 
         let (checkpoint_stop_tx, checkpoint_stop_rx) = std_mpsc::channel();
         let checkpoint_timings = sqlite_timings;
-        let checkpoint_write_admission = Arc::clone(&write_admission_closed);
-        let checkpoint_path = path.to_path_buf();
+        let checkpoint_activity = Arc::clone(&worker_activity);
         let checkpoint_worker = std::thread::Builder::new()
             .name("sqlite-checkpoint".into())
             .spawn(move || {
                 checkpoint_worker(
                     checkpoint_connection,
                     checkpoint_stop_rx,
-                    checkpoint_path,
-                    checkpoint_write_admission,
-                    STORAGE_POLICY,
+                    checkpoint_activity,
                     checkpoint_timings,
                 );
             })
@@ -1139,7 +1092,6 @@ impl Db {
         let (requests, mut receiver) = mpsc::channel::<Request>(REQUEST_CAPACITY);
         let (startup_tx, startup_rx) = std_mpsc::channel();
         let worker_sqlite_timings = sqlite_timings;
-        let worker_write_admission = Arc::clone(&write_admission_closed);
         let worker = match std::thread::Builder::new()
             .name("sqlite".into())
             .spawn(move || {
@@ -1161,6 +1113,7 @@ impl Db {
                 // size; larger or escaped bodies grow the hint when encountered.
                 let mut post_capacity = 256;
                 let mut created_post_capacity = 256;
+                let mut timings = worker_sqlite_timings.then(WorkerTimings::new);
                 let mut pending = None;
                 let mut read_batch: [Option<Request>; READ_BATCH_LIMIT] =
                     std::array::from_fn(|_| None);
@@ -1170,9 +1123,13 @@ impl Db {
                     if request.reply_closed() {
                         continue;
                     }
+                    worker_activity.fetch_add(1, Ordering::AcqRel);
+                    let _activity = WorkerActivity(&worker_activity);
+                    let batch_started = timings.as_ref().map(|_| Instant::now());
                     if request.is_read() && read_batching {
                         let (batch_len, boundary) =
                             collect_read_batch(request, &mut receiver, &mut read_batch);
+                        let collected = timings.as_ref().map(|_| Instant::now());
                         pending = boundary;
                         let live = read_batch[..batch_len]
                             .iter()
@@ -1210,6 +1167,11 @@ impl Db {
                                 );
                             }
                         }
+                        if let (Some(timings), Some(started), Some(collected)) =
+                            (&mut timings, batch_started, collected)
+                        {
+                            timings.record(false, batch_len, started, collected, receiver.len());
+                        }
                         continue;
                     }
                     if request.is_read() {
@@ -1220,23 +1182,32 @@ impl Db {
                             &mut feed_capacity,
                             &mut post_capacity,
                         );
+                        if let (Some(timings), Some(started)) = (&mut timings, batch_started) {
+                            timings.record(false, 1, started, started, receiver.len());
+                        }
                         continue;
                     }
                     let mut write_batch = std::array::from_fn(|_| None);
                     let batch_len = collect_write_batch(request, &mut receiver, &mut write_batch);
+                    let collected = timings.as_ref().map(|_| Instant::now());
                     let capacities = WriteBatchCapacities {
                         feed: &mut feed_capacity,
                         post: &mut post_capacity,
                         created_post: &mut created_post_capacity,
-                        admission_closed: &worker_write_admission,
                     };
-                    if !process_write_batch(
+                    let connection_usable = process_write_batch(
                         &connection,
                         &mut statements,
                         &mut write_batch[..batch_len],
                         capacities,
                         worker_sqlite_timings,
-                    ) {
+                    );
+                    if let (Some(timings), Some(started), Some(collected)) =
+                        (&mut timings, batch_started, collected)
+                    {
+                        timings.record(true, batch_len, started, collected, receiver.len());
+                    }
+                    if !connection_usable {
                         break;
                     }
                 }
@@ -1264,20 +1235,24 @@ impl Db {
         Ok(Self {
             requests,
             worker_thread: worker.thread().clone(),
-            write_admission_closed,
+            admission_timings: sqlite_timings.then(|| Arc::new(AdmissionTimings::default())),
         })
     }
 
-    async fn reserve_request(&self) -> Result<mpsc::Permit<'_, Request>, DbError> {
+    async fn reserve_request(&self, write: bool) -> Result<mpsc::Permit<'_, Request>, DbError> {
+        let started = self.admission_timings.as_ref().map(|_| Instant::now());
         // Let short bursts drain without growing the channel or waiting indefinitely.
-        tokio::time::timeout(REQUEST_ADMISSION_TIMEOUT, self.requests.reserve())
-            .await
+        let result = tokio::time::timeout(REQUEST_ADMISSION_TIMEOUT, self.requests.reserve()).await;
+        if let (Some(timings), Some(started)) = (&self.admission_timings, started) {
+            timings.record(started, write, result.is_err(), self.requests.capacity());
+        }
+        result
             .map_err(|_| DbError::WorkerBusy)?
             .map_err(|_| DbError::WorkerUnavailable)
     }
 
     async fn request<T>(&self, make: impl FnOnce(Reply<T>) -> Request) -> Result<T, DbError> {
-        let permit = self.reserve_request().await?;
+        let permit = self.reserve_request(false).await?;
         let (reply, receiver) = oneshot::channel();
         permit.send(make(reply));
         self.worker_thread.unpark();
@@ -1285,16 +1260,7 @@ impl Db {
     }
 
     async fn write_request<T>(&self, make: impl FnOnce(Reply<T>) -> Request) -> Result<T, DbError> {
-        if self.write_admission_closed.load(Ordering::Acquire) {
-            return Err(DbError::WorkerBusy);
-        }
-        // Reserve queue capacity and enqueue; the worker serializes SQL work.
-        let permit = self.reserve_request().await?;
-        if self.write_admission_closed.load(Ordering::Acquire) {
-            drop(permit);
-            return Err(DbError::WorkerBusy);
-        }
-
+        let permit = self.reserve_request(true).await?;
         let (reply, receiver) = oneshot::channel();
         permit.send(make(reply));
         self.worker_thread.unpark();
@@ -1336,6 +1302,20 @@ impl Db {
         })
         .await
     }
+}
+
+fn configure_page_cache(connection: &Connection, page_cache_kib: u64) -> Result<(), DbError> {
+    let page_cache_kib = i32::try_from(page_cache_kib)
+        .ok()
+        .filter(|size| *size > 0)
+        .ok_or(DbError::InvalidPageCacheSize)?;
+    let page_size: u32 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let pages = page_cache_kib as u64 * 1024 / u64::from(page_size);
+    if !(1..=1_000_000_000).contains(&pages) {
+        return Err(DbError::InvalidPageCacheSize);
+    }
+    connection.pragma_update(None, "cache_size", -i64::from(page_cache_kib))?;
+    Ok(())
 }
 
 fn configure_mmap_size(connection: &Connection, requested_bytes: u64) -> Result<i64, DbError> {
@@ -1667,189 +1647,6 @@ mod tests {
     }
 
     #[test]
-    fn threshold_passive_checkpoint_catches_up_without_invalidating_reader_snapshot() {
-        let (_directory, path) = fixture();
-        let writer = Connection::open(&path).unwrap();
-        let journal_mode: String = writer
-            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
-        writer.pragma_update(None, "synchronous", "NORMAL").unwrap();
-        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-
-        let reader = Connection::open(&path).unwrap();
-        let snapshot = reader.unchecked_transaction().unwrap();
-        assert_eq!(
-            snapshot
-                .query_row("SELECT count(*) FROM posts", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        let observer = Connection::open(&path).unwrap();
-        let checkpoint_connection = Connection::open(&path).unwrap();
-        checkpoint_connection.busy_timeout(Duration::ZERO).unwrap();
-        checkpoint_connection
-            .pragma_update(None, "wal_autocheckpoint", 0)
-            .unwrap();
-
-        let (stop_tx, stop_rx) = std_mpsc::channel();
-        let checkpoint_gate = Arc::new(AtomicBool::new(false));
-        let checkpoint = std::thread::spawn(move || {
-            checkpoint_worker(
-                checkpoint_connection,
-                stop_rx,
-                path,
-                checkpoint_gate,
-                StoragePolicy {
-                    sample_interval: Duration::from_millis(5),
-                    checkpoint_interval: Duration::from_millis(5),
-                    soft_bytes: 1,
-                    reject_bytes: u64::MAX,
-                    resume_bytes: 0,
-                },
-                false,
-            );
-        });
-
-        for index in 0..128 {
-            writer
-                .execute(
-                    "INSERT INTO posts (user_id, body) VALUES (1, ?1)",
-                    [format!("pinned-{index}")],
-                )
-                .unwrap();
-        }
-        std::thread::sleep(Duration::from_millis(40));
-        writer
-            .execute(
-                "INSERT INTO posts (user_id, body) VALUES (1, 'still-writable')",
-                [],
-            )
-            .unwrap();
-        assert_eq!(
-            snapshot
-                .query_row("SELECT count(*) FROM posts", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            0,
-            "PASSIVE checkpointing must preserve the reader's existing snapshot"
-        );
-        let pinned: (i64, i64) = observer
-            .query_row("PRAGMA wal_checkpoint(NOOP)", [], |row| {
-                Ok((row.get(1)?, row.get(2)?))
-            })
-            .unwrap();
-        assert!(pinned.0 > 0, "writes should remain in the WAL");
-        assert!(
-            pinned.1 < pinned.0,
-            "the pinned snapshot should limit backfill"
-        );
-
-        drop(snapshot);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let progress: (i64, i64) = observer
-                .query_row("PRAGMA wal_checkpoint(NOOP)", [], |row| {
-                    Ok((row.get(1)?, row.get(2)?))
-                })
-                .unwrap();
-            if progress.0 == progress.1 {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "threshold-triggered PASSIVE did not catch up"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        stop_tx.send(()).unwrap();
-        checkpoint.join().unwrap();
-    }
-
-    #[test]
-    fn passive_checkpoint_stays_idle_below_soft_threshold_after_interval() {
-        let (_directory, path) = fixture();
-        let writer = Connection::open(&path).unwrap();
-        let journal_mode: String = writer
-            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
-        writer.pragma_update(None, "synchronous", "NORMAL").unwrap();
-        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-
-        let observer = Connection::open(&path).unwrap();
-        let checkpoint_connection = Connection::open(&path).unwrap();
-        checkpoint_connection.busy_timeout(Duration::ZERO).unwrap();
-        checkpoint_connection
-            .pragma_update(None, "wal_autocheckpoint", 0)
-            .unwrap();
-
-        let (stop_tx, stop_rx) = std_mpsc::channel();
-        let checkpoint = std::thread::spawn(move || {
-            checkpoint_worker(
-                checkpoint_connection,
-                stop_rx,
-                path,
-                Arc::new(AtomicBool::new(false)),
-                StoragePolicy {
-                    sample_interval: Duration::from_millis(5),
-                    checkpoint_interval: Duration::from_millis(5),
-                    soft_bytes: u64::MAX,
-                    reject_bytes: u64::MAX,
-                    resume_bytes: 0,
-                },
-                false,
-            );
-        });
-
-        for index in 0..128 {
-            writer
-                .execute(
-                    "INSERT INTO posts (user_id, body) VALUES (1, ?1)",
-                    [format!("below-threshold-{index}")],
-                )
-                .unwrap();
-        }
-        std::thread::sleep(Duration::from_millis(40));
-        let progress: (i64, i64) = observer
-            .query_row("PRAGMA wal_checkpoint(NOOP)", [], |row| {
-                Ok((row.get(1)?, row.get(2)?))
-            })
-            .unwrap();
-        assert!(progress.0 > 0, "writes should remain in the WAL");
-        assert_eq!(
-            progress.1, 0,
-            "below-threshold WAL should not be backfilled"
-        );
-
-        stop_tx.send(()).unwrap();
-        checkpoint.join().unwrap();
-    }
-
-    #[test]
-    fn checkpoint_retries_are_rate_limited_after_first_eligible_sample() {
-        let now = Instant::now();
-        let interval = Duration::from_secs(30);
-
-        assert!(!checkpoint_due(false, false, None, now, interval));
-        assert!(checkpoint_due(true, false, None, now, interval));
-        assert!(!checkpoint_due(
-            true,
-            true,
-            Some(now - Duration::from_secs(29)),
-            now,
-            interval
-        ));
-        assert!(checkpoint_due(
-            true,
-            true,
-            Some(now - interval),
-            now,
-            interval
-        ));
-    }
-
-    #[test]
     fn mmap_size_reports_the_effective_value_from_the_configured_connection() {
         let (_directory, path) = fixture();
         let connection = Connection::open(path).unwrap();
@@ -1996,8 +1793,8 @@ mod tests {
         drop(receiver);
         let db = Db {
             requests,
-            write_admission_closed: Arc::new(AtomicBool::new(false)),
             worker_thread: std::thread::current(),
+            admission_timings: None,
         };
         assert!(matches!(db.health().await, Err(DbError::WorkerUnavailable)));
     }
@@ -2007,8 +1804,8 @@ mod tests {
         let (requests, mut receiver) = mpsc::channel(1);
         let db = Db {
             requests,
-            write_admission_closed: Arc::new(AtomicBool::new(false)),
             worker_thread: std::thread::current(),
+            admission_timings: None,
         };
         let first_db = db.clone();
         let first = tokio::spawn(async move { first_db.health().await });
@@ -2051,8 +1848,8 @@ mod tests {
             let (requests, mut receiver) = mpsc::channel(1);
             let db = Db {
                 requests,
-                write_admission_closed: Arc::new(AtomicBool::new(false)),
                 worker_thread: std::thread::current(),
+                admission_timings: None,
             };
             let (reply, _result) = oneshot::channel();
             db.requests.try_send(Request::Health(reply)).unwrap();
@@ -2078,33 +1875,6 @@ mod tests {
             });
             result.unwrap();
         }
-    }
-
-    #[tokio::test]
-    async fn write_admission_is_rechecked_after_waiting_for_queue_capacity() {
-        let (requests, mut receiver) = mpsc::channel(1);
-        let db = Db {
-            requests,
-            write_admission_closed: Arc::new(AtomicBool::new(false)),
-            worker_thread: std::thread::current(),
-        };
-        let (reply, _result) = oneshot::channel();
-        db.requests.try_send(Request::Health(reply)).unwrap();
-        let waiting = db.write_request(Request::Health);
-        tokio::pin!(waiting);
-        tokio::select! {
-            biased;
-            result = &mut waiting => panic!("full queue should wait: {result:?}"),
-            _ = std::future::ready(()) => {}
-        }
-        db.write_admission_closed.store(true, Ordering::Release);
-        drop(receiver.recv().await.unwrap());
-        assert!(matches!(waiting.await, Err(DbError::WorkerBusy)));
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-        assert_eq!(db.requests.capacity(), 1);
     }
 
     #[tokio::test]
@@ -2253,54 +2023,6 @@ mod tests {
     }
 
     #[test]
-    fn storage_budget_rejects_queued_writes_but_keeps_health_reads_available() {
-        let (_directory, path) = fixture();
-        let connection = Connection::open(&path).unwrap();
-        let mut statements = WorkerStatements::prepare(&connection).unwrap();
-        let mut batch: [Option<Request>; WRITE_BATCH_LIMIT] = std::array::from_fn(|_| None);
-        let (write_reply, write_response) = oneshot::channel();
-        let (health_reply, health_response) = oneshot::channel();
-        batch[0] = Some(Request::CreatePost {
-            user_id: 1,
-            body: "must be rejected at storage high water".into(),
-            username: "alice".into(),
-            reply: write_reply,
-        });
-        batch[1] = Some(Request::Health(health_reply));
-        let mut feed_capacity = 4096;
-        let mut post_capacity = 256;
-        let mut created_post_capacity = 256;
-        let admission_closed = AtomicBool::new(true);
-
-        assert!(process_write_batch(
-            &connection,
-            &mut statements,
-            &mut batch[..2],
-            WriteBatchCapacities {
-                feed: &mut feed_capacity,
-                post: &mut post_capacity,
-                created_post: &mut created_post_capacity,
-                admission_closed: &admission_closed,
-            },
-            false,
-        ));
-        assert!(matches!(
-            write_response.blocking_recv().unwrap(),
-            Err(DbError::WorkerBusy)
-        ));
-        health_response.blocking_recv().unwrap().unwrap();
-        assert_eq!(
-            connection
-                .query_row("SELECT count(*) FROM posts", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        assert!(!should_resume_write_admission(1, 2, false));
-        assert!(!should_resume_write_admission(2, 2, true));
-        assert!(should_resume_write_admission(1, 2, true));
-    }
-
-    #[test]
     fn write_batch_preserves_valid_writes_around_item_failure_and_read_order() {
         let (_directory, path) = fixture();
         let connection = Connection::open(&path).unwrap();
@@ -2332,7 +2054,6 @@ mod tests {
         let mut feed_capacity = 4096;
         let mut post_capacity = 256;
         let mut created_post_capacity = 256;
-        let admission_closed = AtomicBool::new(false);
 
         assert!(process_write_batch(
             &connection,
@@ -2342,7 +2063,6 @@ mod tests {
                 feed: &mut feed_capacity,
                 post: &mut post_capacity,
                 created_post: &mut created_post_capacity,
-                admission_closed: &admission_closed,
             },
             false
         ));
@@ -2385,7 +2105,6 @@ mod tests {
         let mut feed_capacity = 4096;
         let mut post_capacity = 256;
         let mut created_post_capacity = 256;
-        let admission_closed = AtomicBool::new(false);
 
         assert!(process_write_batch(
             &connection,
@@ -2395,7 +2114,6 @@ mod tests {
                 feed: &mut feed_capacity,
                 post: &mut post_capacity,
                 created_post: &mut created_post_capacity,
-                admission_closed: &admission_closed,
             },
             false
         ));
@@ -2444,56 +2162,6 @@ mod tests {
         active_result.await.unwrap().unwrap();
         assert!(live_result.await.unwrap().unwrap().is_some());
         db.health().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn feed_batch_executes_once_and_next_batch_reads_current_data() {
-        let (_directory, path) = fixture();
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute(
-                "INSERT INTO posts (id, user_id, body) VALUES (1, 1, 'first')",
-                [],
-            )
-            .unwrap();
-        let mut statements = WorkerStatements::prepare(&connection).unwrap();
-        let mut feed_capacity = 4096;
-        let mut post_capacity = 256;
-        for body in ["first", "updated"] {
-            connection
-                .execute("UPDATE posts SET body = ?1 WHERE id = 1", [body])
-                .unwrap();
-            statements.feed.reset_status(rusqlite::StatementStatus::Run);
-            let mut batch = std::array::from_fn(|_| None);
-            let mut responses = Vec::new();
-            for slot in &mut batch {
-                let (reply, response) = oneshot::channel();
-                *slot = Some(Request::Feed(reply));
-                responses.push(response);
-            }
-            assert!(process_read_batch(
-                &connection,
-                &mut statements,
-                &mut batch,
-                READ_BATCH_LIMIT,
-                &mut feed_capacity,
-                &mut post_capacity
-            ));
-            assert_eq!(
-                statements.feed.get_status(rusqlite::StatementStatus::Run),
-                1
-            );
-            let mut replies = Vec::new();
-            for response in responses {
-                let bytes = response.await.unwrap().unwrap();
-                assert_eq!(json(&bytes)["posts"][0]["body"], body);
-                if let Some(first) = replies.first() {
-                    let first: &Bytes = first;
-                    assert_eq!(bytes.as_ptr(), first.as_ptr());
-                }
-                replies.push(bytes);
-            }
-        }
     }
 
     #[tokio::test]
