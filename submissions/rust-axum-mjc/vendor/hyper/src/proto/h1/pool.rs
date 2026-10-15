@@ -1,5 +1,6 @@
 //! Bounded thread-local reuse across active connections, rather than idle ones.
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::BytesMut;
 use http::HeaderMap;
@@ -7,11 +8,37 @@ use http::HeaderMap;
 const MAX_BUFFERS: usize = 128;
 pub(super) const MAX_BUFFER_CAPACITY: usize = 8192;
 const MAX_HEADER_CAPACITY: usize = 32;
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static READS: RefCell<Vec<BytesMut>> = const { RefCell::new(Vec::new()) };
     static WRITES: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
     static HEADERS: RefCell<Vec<HeaderMap>> = const { RefCell::new(Vec::new()) };
+}
+
+// Keep this after the connection's I/O and state fields so their storage is
+// dropped before the last connection releases the unused pool storage.
+pub(super) struct ConnectionGuard;
+
+impl ConnectionGuard {
+    pub(super) fn new() -> Self {
+        ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        // The counter only controls reuse; it does not publish connection data.
+        if ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) == 1 {
+            // Connections may move between threads. Clearing this thread's
+            // unused storage is safe even if another connection has just opened.
+            // On a single-thread runtime this releases all three pools at drain.
+            let _ = READS.try_with(|pool| *pool.borrow_mut() = Vec::new());
+            let _ = WRITES.try_with(|pool| *pool.borrow_mut() = Vec::new());
+            let _ = HEADERS.try_with(|pool| *pool.borrow_mut() = Vec::new());
+        }
+    }
 }
 
 pub(super) fn take_read() -> BytesMut {

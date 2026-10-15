@@ -51,6 +51,12 @@ cached header maps to bounded thread-local pools. Each pool retains at most
 128 items; buffers above 8 KiB and header maps with capacity above 32 are not
 retained. Active connections reuse this storage, avoiding both per-connection
 idle capacity and repeated allocation on the normal small-request path.
+Server responses return their empty header maps after encoding. Server-only
+builds omit the per-connection header-cache field; client caching is unchanged.
+A zero-sized connection guard releases the current thread's pooled objects and
+pool vectors when the last HTTP/1 connection closes. This clears all three pools
+on the application's single-thread runtime; other threads' bounded pools remain
+available on runtimes with multiple threads.
 Scalar body deques retain their existing single-buffer slot for reuse.
 Empty reads at the initial adaptive size use a 1 KiB stack buffer, then acquire
 a pooled buffer only when bytes arrive. Larger adaptive reads keep the direct
