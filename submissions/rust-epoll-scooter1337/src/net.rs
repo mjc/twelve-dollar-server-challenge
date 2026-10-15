@@ -183,6 +183,7 @@ pub fn run(address: &str, mut app: App, options: Options) -> io::Result<()> {
         if n > 0 {
             hot_until = Instant::now() + Duration::from_micros(options.spin_us);
         }
+        let _batch_activity = (n > 0 || !ready.is_empty()).then(|| app.db.batch());
         let now = start.elapsed().as_secs();
         epoch = epoch.wrapping_add(1);
         arena.clear();

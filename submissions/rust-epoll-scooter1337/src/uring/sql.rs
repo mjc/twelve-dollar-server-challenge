@@ -216,6 +216,7 @@ pub(super) fn start(app: Arc<Mutex<App>>, rings: usize) -> io::Result<Vec<Port>>
             // preserves the App's SQLite Send invariant and supports tests that
             // deliberately stall SQL without stalling transport completion work.
             let mut app = app.lock().unwrap();
+            let batch_activity = app.db.batch();
             for job in &batch {
                 queue_max = queue_max.max(job.queued.elapsed().as_micros());
                 let mut body = Vec::with_capacity(512);
@@ -230,6 +231,7 @@ pub(super) fn start(app: Arc<Mutex<App>>, rings: usize) -> io::Result<Vec<Port>>
             let committed = app.db.commit();
             commit_max = commit_max.max(start.elapsed().as_micros());
             let commit_end = if traced { crate::latency_trace::now() } else { 0 };
+            drop(batch_activity);
             drop(app);
             let mut wake = 0u64;
             for (job, mut reply) in batch.drain(..).zip(replies.drain(..)) {

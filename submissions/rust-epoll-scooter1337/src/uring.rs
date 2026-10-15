@@ -79,12 +79,12 @@ impl Buffer {
         // reserve initializes exactly the written prefix before increasing len.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len as usize) }
     }
-    fn reserve(&mut self, needed: usize) {
+    fn reserve(&mut self, needed: usize, minimum: usize) {
         if needed <= self.cap as usize {
             return;
         }
         assert!(needed <= 4 * 1024 * 1024);
-        let cap = needed.max(4096).next_power_of_two();
+        let cap = needed.max(minimum).next_power_of_two();
         let layout = Layout::from_size_align(cap, 8).unwrap();
         // Both allocation paths use the same alignment and allocator. No caller
         // may grow a Buffer after it has been transferred into Client::flight.
@@ -106,8 +106,14 @@ impl Buffer {
         self.cap = cap as u32;
     }
     fn extend(&mut self, bytes: &[u8]) {
+        self.extend_with_floor(bytes, 4096);
+    }
+    fn extend_input(&mut self, bytes: &[u8]) {
+        self.extend_with_floor(bytes, 256);
+    }
+    fn extend_with_floor(&mut self, bytes: &[u8], minimum: usize) {
         let old = self.len as usize;
-        self.reserve(old + bytes.len());
+        self.reserve(old + bytes.len(), minimum);
         if !bytes.is_empty() {
             // Source and destination are distinct allocations (or stack bytes).
             unsafe {
@@ -223,6 +229,7 @@ struct Worker {
     trace_active: bool,
     sql: Option<sql::Port>,
     sql_waiters: VecDeque<(usize, u32)>,
+    input_cap_bytes: usize,
 }
 fn tag(op: u64, fd: usize, generation: u32) -> u64 {
     op | ((fd as u64) << 8) | ((generation as u64) << 32)
@@ -282,6 +289,7 @@ impl Worker {
             trace_active: false,
             sql: None,
             sql_waiters: VecDeque::new(),
+            input_cap_bytes: 0,
         };
         if w.buf_ring.is_some() {
             for bid in 0..NBUFS {
@@ -539,6 +547,7 @@ impl Worker {
         );
         let c = &mut self.clients[fd];
         let generation = c.generation.wrapping_add(1);
+        self.input_cap_bytes -= c.input.cap as usize;
         *c = Client {
             generation,
             ..Default::default()
@@ -548,12 +557,14 @@ impl Worker {
     fn process(&mut self, fd: usize, bytes: &[u8]) {
         let process_ns = crate::latency_trace::now();
         let mut saved = std::mem::take(&mut self.clients[fd].input);
+        self.input_cap_bytes -= saved.cap as usize;
         if self.clients[fd].state & (PAUSED | SQL_PENDING | SQL_WAIT) != 0 {
             if saved.len as usize + bytes.len() <= INPUT_LIMIT {
-                saved.extend(bytes);
+                saved.extend_input(bytes);
             } else {
                 self.clients[fd].state |= CLOSING;
             }
+            self.input_cap_bytes += saved.cap as usize;
             self.clients[fd].input = saved;
             return;
         }
@@ -561,7 +572,7 @@ impl Worker {
             bytes
         } else {
             if saved.len as usize + bytes.len() <= INPUT_LIMIT {
-                saved.extend(bytes);
+                saved.extend_input(bytes);
             } else {
                 self.clients[fd].state |= CLOSING;
                 self.close(fd);
@@ -635,10 +646,11 @@ impl Worker {
         }
         if !closing && offset < input.len() {
             if saved.len == 0 {
-                saved.extend(&bytes[offset..]);
+                saved.extend_input(&bytes[offset..]);
             } else {
                 saved.consume(offset);
             }
+            self.input_cap_bytes += saved.cap as usize;
             self.clients[fd].input = saved;
         } else if saved.cap != 0 {
             self.retire(saved);
@@ -973,7 +985,7 @@ impl Worker {
             if self.now > stats_second {
                 stats_second = self.now;
                 eprintln!(
-                    "RING_STATS ns={} second={} open={} cq={} cq_peak={} rearm={} ready={} sq={} loops={} cqes={} accepts={} recv_ok={} enobufs={} recv_other={} sends={} selected={}",
+                    "RING_STATS ns={} second={} open={} cq={} cq_peak={} rearm={} ready={} sq={} loops={} cqes={} accepts={} recv_ok={} enobufs={} recv_other={} sends={} selected={} sql_wait={} input_cap_bytes={}",
                     crate::latency_trace::now(),
                     self.now,
                     self.open,
@@ -989,7 +1001,9 @@ impl Worker {
                     stats[4],
                     stats[5],
                     stats[6],
-                    stats[7]
+                    stats[7],
+                    self.sql_waiters.len(),
+                    self.input_cap_bytes,
                 );
                 cq_peak = 0;
             }
@@ -1422,6 +1436,11 @@ mod sql_tests {
             );
         }
         assert_ne!(w.clients[0].input.len, 0, "pipeline tail must remain owned");
+        assert_eq!(
+            w.clients[0].input.cap, 256,
+            "small input must avoid4KiB padding"
+        );
+        assert_eq!(w.input_cap_bytes, 256);
         peer.shutdown(Shutdown::Write).unwrap();
         w.on_recv(0, 0, 0, 0);
         assert_ne!(w.clients[0].state & LIVE, 0, "pending SQL retains the slot");
@@ -1499,6 +1518,7 @@ mod sql_tests {
             "{response}"
         );
         assert_eq!(w.open, 0);
+        assert_eq!(w.input_cap_bytes, 0);
         drop(w);
         drop(app);
         let _ = std::fs::remove_file(path);

@@ -4,7 +4,7 @@ use std::{
     ptr, slice,
     sync::{
         Arc,
-        atomic::{AtomicI32, Ordering},
+        atomic::{AtomicI32, AtomicU64, Ordering},
     },
 };
 
@@ -134,6 +134,7 @@ pub struct Db {
     rollback_stmt: Stmt,
     raw: *mut Connection,
     wal_frames: Arc<AtomicI32>,
+    activity: Arc<AtomicU64>,
     checkpointer: Option<checkpoint::Checkpointer>,
     pub transaction: bool,
     pub group: bool,
@@ -152,6 +153,9 @@ unsafe extern "C" fn wal_hook(
     0
 }
 impl Db {
+    pub(crate) fn batch(&self) -> checkpoint::Batch {
+        checkpoint::Batch::new(Arc::clone(&self.activity))
+    }
     pub fn open(path: &str, group: bool) -> Self {
         let path = CString::new(path).expect("SQLITE_PATH contains NUL");
         let mut raw = ptr::null_mut();
@@ -225,6 +229,7 @@ impl Db {
             rollback_stmt: prepare(raw, "ROLLBACK"),
             raw,
             wal_frames: Arc::new(AtomicI32::new(0)),
+            activity: Arc::new(AtomicU64::new(0)),
             checkpointer: None,
             transaction: false,
             group,
@@ -239,6 +244,7 @@ impl Db {
         db.checkpointer = Some(checkpoint::Checkpointer::start(
             path,
             Arc::clone(&db.wal_frames),
+            Arc::clone(&db.activity),
         ));
         db
     }

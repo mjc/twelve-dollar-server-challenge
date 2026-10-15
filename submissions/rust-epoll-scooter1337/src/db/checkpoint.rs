@@ -16,8 +16,24 @@ impl Drop for CheckpointConnection {
     }
 }
 
+// The request connection has one serialized owner. Odd generations mean a
+// query/COMMIT batch is in progress; even generations change after every batch.
+pub(crate) struct Batch(Arc<AtomicU64>);
+impl Batch {
+    pub(super) fn new(activity: Arc<AtomicU64>) -> Self {
+        let previous = activity.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(previous & 1, 0, "nested SQL batch");
+        Self(activity)
+    }
+}
+impl Drop for Batch {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Release);
+    }
+}
+
 impl Checkpointer {
-    pub(super) fn start(path: CString, frames: Arc<AtomicI32>) -> Self {
+    pub(super) fn start(path: CString, frames: Arc<AtomicI32>, activity: Arc<AtomicU64>) -> Self {
         let (stop, receiver) = mpsc::channel();
         let (ready, started) = mpsc::sync_channel(0);
         let worker = thread::Builder::new()
@@ -32,17 +48,28 @@ impl Checkpointer {
                 // SAFETY: connection and SQL are live, and callbacks are disabled.
                 assert_eq!(unsafe { sqlite3_exec(connection.0, sql.as_ptr(), ptr::null(), ptr::null_mut(), ptr::null_mut()) }, 0);
                 ready.send(()).expect("checkpoint startup receiver");
+                let mut observed = activity.load(Ordering::Acquire);
                 while matches!(receiver.recv_timeout(Duration::from_secs(1)), Err(mpsc::RecvTimeoutError::Timeout)) {
+                    let generation = activity.load(Ordering::Acquire);
+                    let quiet = generation == observed && generation & 1 == 0;
+                    observed = generation;
                     let current = frames.load(Ordering::Relaxed);
-                    if current < 1000 {
+                    if !quiet || current < 1000 {
                         continue;
                     }
+                    if activity.load(Ordering::Acquire) != generation { continue; }
+                    let start = std::time::Instant::now();
+                    eprintln!("CHECKPOINT begin ns={} generation={} frames={}", crate::latency_trace::now(), generation, current);
                     let mut log = 0;
                     let mut backfilled = 0;
                     // SAFETY: this thread exclusively owns the connection. Both
                     // output pointers are valid. PASSIVE never waits for readers
                     // or the writer to release their locks (busy timeout is zero).
                     let rc = unsafe { sqlite3_wal_checkpoint_v2(connection.0, ptr::null(), 0, &mut log, &mut backfilled) };
+                    eprintln!("CHECKPOINT end ns={} generation={} rc={} frames={} backfilled={} elapsed_us={}", crate::latency_trace::now(), activity.load(Ordering::Acquire), rc, log, backfilled, start.elapsed().as_micros());
+                    // A newly arriving batch may overlap an idle-started PASSIVE
+                    // checkpoint. Continuous traffic can grow WAL; this is not
+                    // an active-WAL size quota or a guarantee of zero I/O stalls.
                     if rc != 0 && rc != 5 {
                         eprintln!("background SQLite checkpoint failed: {rc}");
                     }
@@ -170,6 +197,41 @@ mod tests {
             "x".repeat(500)
         );
         drop(reopened);
+        std::fs::remove_file(fixture).unwrap();
+    }
+    #[test]
+    fn checkpoint_waits_for_completed_quiet_sql_batch() {
+        let fixture =
+            std::env::temp_dir().join(format!("scooter-idle-checkpoint-{}.db", std::process::id()));
+        let path = CString::new(fixture.to_str().unwrap()).unwrap();
+        {
+            let setup = open(&path);
+            exec(
+                &setup,
+                &CString::new(include_str!("../../../../schema.sql")).unwrap(),
+            );
+            exec(&setup, c"INSERT INTO users(id,username) VALUES(1,'alice');");
+        }
+        let mut db = Db::open(fixture.to_str().unwrap(), true);
+        let batch = db.batch();
+        let mut out = Vec::new();
+        for _ in 0..500 {
+            out.clear();
+            assert_eq!(db.create(1, "alice", &"x".repeat(500), &mut out), 201);
+            assert!(db.commit());
+        }
+        assert!(db.wal_frames.load(Ordering::Relaxed) >= 1000);
+        // A stalled batch must remain busy even when the request queue is empty.
+        thread::sleep(Duration::from_millis(2200));
+        let (log, backfilled) = progress(&db).unwrap();
+        assert!(log >= 1000);
+        assert_eq!(
+            backfilled, 0,
+            "checkpoint must not start during a SQL batch"
+        );
+        drop(batch);
+        wait_for(&db, |log, backfilled| log > 0 && log == backfilled);
+        drop(db);
         std::fs::remove_file(fixture).unwrap();
     }
 }
