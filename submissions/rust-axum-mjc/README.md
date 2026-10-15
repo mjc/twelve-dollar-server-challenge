@@ -8,10 +8,17 @@ registration. Hyper state, a Tokio socket registration, and a task exist only
 while a connection is active. After Hyper has finished the request and flushed
 the response, the socket and service return to idle storage. Partial requests,
 pipelined input, pending handlers, and unfinished writes stay active.
-Each idle registration receives a fresh token that is never reused, so a stale
+Each accepted connection receives a token that is never reused, so a stale
 readiness event cannot select a new connection that reused its file descriptor.
+Its one-shot epoll entry stays disabled while the socket is active. Returning to
+idle rearms the same entry with MOD, which checks readiness again after any
+temporary Tokio registration has ended. Closing a socket removes its entry.
+The idle map's key holds the token; only active sessions carry another copy.
 Active sessions have separate Tokio tasks and scheduling budgets. Readiness
 batches contain at most 1,024 events; the server does not scan idle sockets.
+There are at most 8,192 active sessions and one shared epoll descriptor. Active
+entries retain kernel storage until close or shutdown. The CPU and memory effects
+of retaining these entries have not yet been measured under comparable load.
 Hyper uses Tokio sockets through its native adapter while active, avoiding a
 second transport buffer and boxed completion-I/O futures for reads and flushes.
 The vendored Hyper 1.12.0 starts HTTP/1 reads at 1 KiB and allocates response

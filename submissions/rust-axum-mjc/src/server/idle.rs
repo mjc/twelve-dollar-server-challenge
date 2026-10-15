@@ -6,14 +6,13 @@ use crate::web::Response;
 use axum::http::Request;
 use hyper::{body::Incoming, server::conn::http1, service::Service};
 use hyper_util::rt::TokioIo;
-use mio::{Events, Interest, Token, unix::SourceFd};
 use std::{
     collections::HashMap,
     convert::Infallible,
     future::Future,
     io,
     net::TcpStream,
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     pin::Pin,
     task::{Context, Poll, ready},
     time::Duration,
@@ -35,64 +34,97 @@ struct IdleConnection<S> {
 }
 
 struct IdleSockets<S> {
-    connections: HashMap<Token, IdleConnection<S>>,
-    readiness: AsyncFd<mio::Poll>,
-    next_token: usize,
+    connections: HashMap<u64, IdleConnection<S>>,
+    readiness: AsyncFd<OwnedFd>,
+    next_token: u64,
 }
 
 impl<S> IdleSockets<S> {
     fn new() -> io::Result<Self> {
+        // SAFETY: epoll_create1 has no pointer arguments and returns a new FD.
+        let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the successful call created this FD; no other owner exists.
+        let epoll = unsafe { OwnedFd::from_raw_fd(fd) };
         Ok(Self {
             connections: HashMap::new(),
-            readiness: AsyncFd::new(mio::Poll::new()?)?,
+            readiness: AsyncFd::new(epoll)?,
             next_token: 0,
         })
     }
 
-    fn push(&mut self, connection: IdleConnection<S>) -> io::Result<()> {
-        let token = Token(self.next_token);
-        self.next_token = self
-            .next_token
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("idle socket token space exhausted"))?;
-        let fd = connection.stream.as_raw_fd();
-        // The map owns the socket until deregistration. Tokens are never reused:
-        // a previously delivered event cannot select a replacement for a closed fd.
-        self.readiness.get_ref().registry().register(
-            &mut SourceFd(&fd),
-            token,
-            Interest::READABLE,
-        )?;
+    fn push(&mut self, connection: IdleConnection<S>, token: Option<u64>) -> io::Result<()> {
+        let (token, operation) = match token {
+            Some(token) => (token, libc::EPOLL_CTL_MOD),
+            None => {
+                let token = self.next_token;
+                self.next_token = token
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("idle socket token space exhausted"))?;
+                (token, libc::EPOLL_CTL_ADD)
+            }
+        };
+        // One-shot delivery disables this entry while the socket is active.
+        // MOD rearms the same entry and rechecks current readiness, including
+        // bytes that arrived before returning from Hyper or Tokio into std.
+        let mut event = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLONESHOT) as u32,
+            u64: token,
+        };
+        // SAFETY: both FDs are owned and live throughout this synchronous call.
+        // epoll_ctl copies the initialized event; it does not retain its address.
+        let result = unsafe {
+            libc::epoll_ctl(
+                self.readiness.get_ref().as_raw_fd(),
+                operation,
+                connection.stream.as_raw_fd(),
+                &mut event,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Tokens follow their socket through active ownership and are never
+        // reused for another socket, even when the OS reuses a closed FD.
         self.connections.insert(token, connection);
         Ok(())
     }
 
-    async fn ready(&mut self, events: &mut Events) -> io::Result<u128> {
+    async fn ready(
+        &mut self,
+        events: &mut [libc::epoll_event; IDLE_READY_BATCH],
+    ) -> io::Result<(usize, u128)> {
         // One Tokio registration watches the idle epoll instance. Waiting here
         // does not create a task or ScheduledIo allocation per idle socket.
         self.readiness
-            .async_io_mut(tokio::io::Interest::READABLE, |poll| {
+            .async_io_mut(tokio::io::Interest::READABLE, |epoll| {
                 let started = Instant::now();
-                poll.poll(events, Some(Duration::ZERO))?;
-                if events.is_empty() {
-                    Err(io::ErrorKind::WouldBlock.into())
-                } else {
-                    Ok(started.elapsed().as_micros())
+                // SAFETY: the owned epoll FD is live; events is writable for
+                // exactly IDLE_READY_BATCH initialized entries. Timeout zero
+                // cannot block the runtime. The kernel returns at most that many.
+                let count = unsafe {
+                    libc::epoll_wait(
+                        epoll.as_raw_fd(),
+                        events.as_mut_ptr(),
+                        IDLE_READY_BATCH as libc::c_int,
+                        0,
+                    )
+                };
+                match count {
+                    -1 => Err(io::Error::last_os_error()),
+                    0 => Err(io::ErrorKind::WouldBlock.into()),
+                    _ => Ok((count as usize, started.elapsed().as_micros())),
                 }
             })
             .await
     }
 
-    fn take_ready(&mut self, token: Token) -> io::Result<Option<IdleConnection<S>>> {
-        let Some(connection) = self.connections.remove(&token) else {
-            return Ok(None);
-        };
-        let fd = connection.stream.as_raw_fd();
-        self.readiness
-            .get_ref()
-            .registry()
-            .deregister(&mut SourceFd(&fd))?;
-        Ok(Some(connection))
+    fn take_ready(&mut self, token: u64) -> Option<IdleConnection<S>> {
+        // Removing the sole idle owner also makes duplicate/stale events inert.
+        // The one-shot kernel entry stays disabled until that owner comes back.
+        self.connections.remove(&token)
     }
 
     fn release_empty_storage(&mut self) {
@@ -107,18 +139,20 @@ where
     S: Service<Request<Incoming>, Response = Response, Error = Infallible>,
 {
     http: Option<http1::Connection<TokioIo<Socket>, S>>,
+    token: u64,
 }
 
 impl<S> ActiveConnection<S>
 where
     S: Service<Request<Incoming>, Response = Response, Error = Infallible>,
 {
-    fn new(connection: IdleConnection<S>, builder: &http1::Builder) -> Self {
+    fn new(connection: IdleConnection<S>, token: u64, builder: &http1::Builder) -> Self {
         Self {
             http: Some(builder.serve_connection(
                 TokioIo::new(Socket::new(connection.stream)),
                 connection.service,
             )),
+            token,
         }
     }
 
@@ -133,7 +167,7 @@ impl<S> Future for ActiveConnection<S>
 where
     S: Service<Request<Incoming>, Response = Response, Error = Infallible>,
 {
-    type Output = io::Result<Option<IdleConnection<S>>>;
+    type Output = io::Result<Option<(u64, IdleConnection<S>)>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -152,10 +186,13 @@ where
                 // Hyper only yields idle when no partial/pipelined input remains.
                 debug_assert!(parts.read_buf.is_empty());
                 parts.io.into_inner().into_std().map(|stream| {
-                    Some(IdleConnection {
-                        stream,
-                        service: parts.service,
-                    })
+                    Some((
+                        this.token,
+                        IdleConnection {
+                            stream,
+                            service: parts.service,
+                        },
+                    ))
                 })
             }
             Ok(false) => Ok(None),
@@ -180,7 +217,7 @@ where
         .writev(true)
         .half_close(true);
     let mut idle = IdleSockets::new()?;
-    let mut events = Events::with_capacity(IDLE_READY_BATCH);
+    let mut events = [libc::epoll_event { events: 0, u64: 0 }; IDLE_READY_BATCH];
     let mut active = JoinSet::new();
     let (stop, _) = watch::channel(false);
     let mut report = tokio::time::interval(Duration::from_secs(1));
@@ -205,7 +242,7 @@ where
                     if let Err(error) = stream.set_nodelay(true) {
                         eprintln!("failed to set TCP_NODELAY: {error}");
                     }
-                    idle.push(IdleConnection { stream: stream.into_std()?, service: service.clone() })?;
+                    idle.push(IdleConnection { stream: stream.into_std()?, service: service.clone() }, None)?;
                 }
                 Err(error) => if accept_error_action(&error) == AcceptErrorAction::Backoff {
                     eprintln!("failed to accept connection: {error}");
@@ -218,17 +255,17 @@ where
             // Completed tasks remain counted until join_next releases them.
             readiness = idle.ready(&mut events),
                 if active.len() <= MAX_ACTIVE_CONNECTIONS - IDLE_READY_BATCH => {
-                let elapsed = match readiness {
-                    Ok(elapsed) => elapsed,
+                let (count, elapsed) = match readiness {
+                    Ok(ready) => ready,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => return Err(error),
                 };
                 scan_us += elapsed;
                 max_scan_us = max_scan_us.max(elapsed);
-                for event in &events {
-                    if let Some(connection) = idle.take_ready(event.token())? {
+                for event in &events[..count] {
+                    if let Some(connection) = idle.take_ready(event.u64) {
                         ready_count += 1;
-                        let mut connection = ActiveConnection::new(connection, &builder);
+                        let mut connection = ActiveConnection::new(connection, event.u64, &builder);
                         let mut shutdown = stop.subscribe();
                         // Each active connection needs its own Tokio
                         // cooperative budget. A FuturesUnordered shares
@@ -265,7 +302,7 @@ where
             completed = active.join_next(), if !active.is_empty() => {
                 completed_count += 1;
                 match completed.expect("active connection missing") {
-                    Ok(Ok(Some(connection))) => idle.push(connection)?,
+                    Ok(Ok(Some((token, connection)))) => idle.push(connection, Some(token))?,
                     Ok(Ok(None)) => {},
                     Ok(Err(error)) => eprintln!("connection failed: {error}"),
                     Err(error) => eprintln!("connection task failed: {error}"),
@@ -274,6 +311,8 @@ where
         }
     }
     drop(listeners);
+    // Closing the shared epoll drops its disabled active entries. Active tasks
+    // own their sockets independently and can finish shutdown without rearming.
     drop(idle);
     let _ = stop.send(true);
     while let Some(result) = active.join_next().await {
