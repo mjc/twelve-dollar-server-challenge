@@ -47,6 +47,11 @@ where
     B: Buf,
     T: Http1Transaction,
 {
+    #[cfg(feature = "server")]
+    pub(crate) fn io_mut(&mut self) -> &mut I {
+        self.io.io_mut()
+    }
+
     pub(crate) fn new(io: I) -> Conn<I, B, T> {
         Conn {
             io: Buffered::new(io),

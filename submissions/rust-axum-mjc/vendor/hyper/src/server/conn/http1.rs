@@ -184,6 +184,12 @@ where
         self.conn.poll_until_idle(cx)
     }
 
+    /// Borrow the transport while preserving HTTP buffers and protocol state.
+    /// Direct reads or writes can desynchronize those buffers.
+    pub fn io_mut(&mut self) -> &mut I {
+        self.conn.io_mut()
+    }
+
     /// Prevent shutdown of the underlying IO object at the end of service the request,
     /// instead run `into_parts`. This is a convenience wrapper over `poll_without_shutdown`.
     ///

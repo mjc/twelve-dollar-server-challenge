@@ -1,7 +1,7 @@
 //! Keep idle sockets without an HTTP future, task, or Tokio registration.
 //! Active connections keep Hyper state until both input and output are complete.
 
-use super::{AcceptErrorAction, accept_any, accept_error_action};
+use super::{AcceptErrorAction, accept_any, accept_error_action, socket::Socket};
 use crate::web::Response;
 use axum::http::Request;
 use hyper::{body::Incoming, server::conn::http1, service::Service};
@@ -106,18 +106,20 @@ struct ActiveConnection<S>
 where
     S: Service<Request<Incoming>, Response = Response, Error = Infallible>,
 {
-    http: Option<http1::Connection<TokioIo<tokio::net::TcpStream>, S>>,
+    http: Option<http1::Connection<TokioIo<Socket>, S>>,
 }
 
 impl<S> ActiveConnection<S>
 where
     S: Service<Request<Incoming>, Response = Response, Error = Infallible>,
 {
-    fn new(connection: IdleConnection<S>, builder: &http1::Builder) -> io::Result<Self> {
-        let stream = tokio::net::TcpStream::from_std(connection.stream)?;
-        Ok(Self {
-            http: Some(builder.serve_connection(TokioIo::new(stream), connection.service)),
-        })
+    fn new(connection: IdleConnection<S>, builder: &http1::Builder) -> Self {
+        Self {
+            http: Some(builder.serve_connection(
+                TokioIo::new(Socket::new(connection.stream)),
+                connection.service,
+            )),
+        }
     }
 
     fn shutdown(&mut self) {
@@ -135,12 +137,14 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let idle = ready!(
-            this.http
-                .as_mut()
-                .expect("HTTP connection missing")
-                .poll_until_idle(cx)
-        );
+        let http = this.http.as_mut().expect("HTTP connection missing");
+        let mut result = http.poll_until_idle(cx);
+        if result.is_pending() && http.io_mut().inner_mut().register_if_blocked()? {
+            // Register before retrying I/O so a readiness edge between the
+            // original WouldBlock and this poll cannot leave HTTP asleep.
+            result = http.poll_until_idle(cx);
+        }
+        let idle = ready!(result);
         let connection = this.http.take().expect("HTTP connection missing");
         Poll::Ready(match idle {
             Ok(true) => {
@@ -171,7 +175,10 @@ where
     F: Future<Output = ()>,
 {
     let mut builder = http1::Builder::new();
-    builder.header_read_timeout(None).writev(false);
+    builder
+        .header_read_timeout(None)
+        .writev(false)
+        .half_close(true);
     let mut idle = IdleSockets::new()?;
     let mut events = Events::with_capacity(IDLE_READY_BATCH);
     let mut active = JoinSet::new();
@@ -221,24 +228,20 @@ where
                 for event in &events {
                     if let Some(connection) = idle.take_ready(event.token())? {
                         ready_count += 1;
-                        match ActiveConnection::new(connection, &builder) {
-                            Ok(mut connection) => {
-                                let mut shutdown = stop.subscribe();
-                                // Each active connection needs its own Tokio
-                                // cooperative budget. A FuturesUnordered shares
-                                // its parent's budget across every HTTP future.
-                                active.spawn(async move {
-                                    tokio::select! {
-                                        result = &mut connection => result,
-                                        _ = shutdown.changed() => {
-                                            connection.shutdown();
-                                            connection.await
-                                        }
-                                    }
-                                });
-                            },
-                            Err(error) => eprintln!("failed to register active socket: {error}"),
-                        }
+                        let mut connection = ActiveConnection::new(connection, &builder);
+                        let mut shutdown = stop.subscribe();
+                        // Each active connection needs its own Tokio
+                        // cooperative budget. A FuturesUnordered shares
+                        // its parent's budget across every HTTP future.
+                        active.spawn(async move {
+                            tokio::select! {
+                                result = &mut connection => result,
+                                _ = shutdown.changed() => {
+                                    connection.shutdown();
+                                    connection.await
+                                }
+                            }
+                        });
                     }
                 }
             },

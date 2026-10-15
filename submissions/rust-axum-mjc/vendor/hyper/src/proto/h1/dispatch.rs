@@ -99,6 +99,11 @@ where
         }
     }
 
+    #[cfg(feature = "server")]
+    pub(crate) fn io_mut(&mut self) -> &mut I {
+        self.conn.io_mut()
+    }
+
     pub(crate) fn into_inner(self) -> (I, Bytes, D) {
         let (io, buf) = self.conn.into_inner();
         (io, buf, self.dispatch)

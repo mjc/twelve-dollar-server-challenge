@@ -19,6 +19,8 @@ use tokio::net::TcpListener;
 
 #[cfg(target_os = "linux")]
 mod idle;
+#[cfg(target_os = "linux")]
+mod socket;
 
 pub async fn serve<S, F>(listener: TcpListener, service: S, shutdown: F) -> io::Result<()>
 where

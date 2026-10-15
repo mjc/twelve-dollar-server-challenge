@@ -72,3 +72,13 @@ response body, or buffered output. `into_parts` then returns the socket and
 service so the application can drop HTTP state while retaining the TCP
 connection. A later request starts a new Hyper session with that same service.
 Closed connections return `false`; errors retain the normal error path.
+
+`Connection::io_mut` exposes the transport without taking apart the HTTP
+connection. The server uses it only to register a socket with Tokio after HTTP
+returns Pending following a blocked read or write, then immediately polls HTTP
+again. Buffered input, output, and protocol state remain in Hyper. Complete
+requests can await their handlers without registering the socket; incomplete
+requests and blocked output use Tokio readiness. The server also enables
+`half_close(true)` so a complete request can finish after the client closes its
+write side. Direct reads or writes through `io_mut` could bypass Hyper's buffers
+and are not used here.

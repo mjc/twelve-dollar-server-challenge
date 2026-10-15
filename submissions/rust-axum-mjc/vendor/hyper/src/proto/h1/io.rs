@@ -57,6 +57,11 @@ where
     T: Read + Write + Unpin,
     B: Buf,
 {
+    #[cfg(feature = "server")]
+    pub(crate) fn io_mut(&mut self) -> &mut T {
+        &mut self.io
+    }
+
     pub(crate) fn new(io: T) -> Buffered<T, B> {
         let strategy = if io.is_write_vectored() {
             WriteStrategy::Queue
