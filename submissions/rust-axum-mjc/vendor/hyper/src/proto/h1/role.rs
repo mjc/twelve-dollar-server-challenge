@@ -260,7 +260,10 @@ impl Http1Transaction for Server {
             None
         };
 
-        let mut headers = ctx.cached_headers.take().unwrap_or_default();
+        let mut headers = ctx
+            .cached_headers
+            .take()
+            .unwrap_or_else(super::pool::take_headers);
         let mut saw_connection_close = false;
 
         headers.reserve(headers_len);

@@ -35,6 +35,7 @@ pub(crate) struct Buffered<T, B> {
     partial_len: Option<usize>,
     read_blocked: bool,
     read_buf: BytesMut,
+    read_buf_poolable: bool,
     read_buf_strategy: ReadStrategy,
     write_buf: WriteBuf<B>,
 }
@@ -69,6 +70,7 @@ where
             partial_len: None,
             read_blocked: false,
             read_buf: BytesMut::with_capacity(0),
+            read_buf_poolable: true,
             read_buf_strategy: ReadStrategy::default(),
             write_buf,
         }
@@ -244,9 +246,37 @@ where
                 .max()
                 .saturating_sub(self.read_buf.len()),
         );
+        // Idle sockets should not retain a heap buffer just to discover Pending.
+        // Keep adaptive larger reads on the existing direct-to-buffer path.
+        if self.read_buf.is_empty() && next <= INIT_BUFFER_SIZE {
+            self.recycle_empty_read_buffer();
+            let mut scratch = [0; INIT_BUFFER_SIZE];
+            let mut buf = ReadBuf::new(&mut scratch[..next]);
+            return match Pin::new(&mut self.io).poll_read(cx, buf.unfilled()) {
+                Poll::Ready(Ok(())) => {
+                    let n = buf.filled().len();
+                    if n > 0 {
+                        self.read_buf = super::pool::take_read();
+                        self.read_buf.extend_from_slice(buf.filled());
+                    }
+                    self.read_buf_strategy.record(n);
+                    Poll::Ready(Ok(n))
+                }
+                Poll::Pending => {
+                    self.read_blocked = true;
+                    Poll::Pending
+                }
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            };
+        }
+        if self.read_buf.capacity() == 0 {
+            self.read_buf = super::pool::take_read();
+        }
         if self.read_buf_remaining_mut() < next {
             self.read_buf.reserve(next);
         }
+
+        self.read_buf_poolable &= self.read_buf.capacity() <= super::pool::MAX_BUFFER_CAPACITY;
 
         // SAFETY: ReadBuf and poll_read promise not to set any uninitialized
         // bytes onto `dst`.
@@ -267,10 +297,24 @@ where
             }
             Poll::Pending => {
                 self.read_blocked = true;
+                if self.read_buf.is_empty() {
+                    self.recycle_empty_read_buffer();
+                }
                 Poll::Pending
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
         }
+    }
+
+    fn recycle_empty_read_buffer(&mut self) {
+        // BytesMut may expose a small tail of a much larger shared allocation.
+        // Remember growth before parsing splits it, rather than retaining that tail.
+        if self.read_buf_poolable {
+            super::pool::recycle_read(&mut self.read_buf);
+        } else {
+            self.read_buf = BytesMut::new();
+        }
+        self.read_buf_poolable = true;
     }
 
     pub(crate) fn into_inner(self) -> (T, Bytes) {
@@ -623,6 +667,9 @@ impl<B: Buf> WriteBuf<B> {
 
     fn headers_mut(&mut self) -> &mut Cursor<Vec<u8>> {
         debug_assert!(!self.queue.has_remaining());
+        if self.headers.bytes.capacity() == 0 {
+            self.headers.bytes = super::pool::take_write();
+        }
         &mut self.headers
     }
 }
@@ -664,6 +711,10 @@ impl<B: Buf> Buf for WriteBuf<B> {
                 self.headers.reset();
                 self.queue.advance(qcnt);
             }
+        }
+        if matches!(self.strategy, WriteStrategy::QueueScalar) && self.remaining() == 0 {
+            // Reuse header storage across connections instead of retaining it idle.
+            super::pool::recycle_write(&mut self.headers.bytes);
         }
     }
 
@@ -742,9 +793,11 @@ mod tests {
                 #[cfg(feature = "client")]
                 on_informational: &mut None,
             };
-            assert!(buffered
-                .parse::<ClientTransaction>(cx, parse_ctx)
-                .is_pending());
+            assert!(
+                buffered
+                    .parse::<ClientTransaction>(cx, parse_ctx)
+                    .is_pending()
+            );
             Poll::Ready(())
         })
         .await;
@@ -970,6 +1023,51 @@ mod tests {
         let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(Mock::new().build()));
         buffered.set_max_buf_size(MINIMUM_MAX_BUFFER_SIZE);
         assert_eq!(buffered.read_buf_strategy.max(), MINIMUM_MAX_BUFFER_SIZE);
+    }
+
+    #[tokio::test]
+    async fn pending_empty_reads_release_storage_without_losing_partial_headers() {
+        let mock = Mock::new().wait(Duration::from_secs(1)).build();
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(mock));
+        buffered.read_buf.reserve(8192);
+        futures_util::future::poll_fn(|cx| {
+            assert!(buffered.poll_read_from_io(cx).is_pending());
+            assert_eq!(buffered.read_buf.capacity(), 0);
+            assert!(buffered.poll_read_from_io(cx).is_pending());
+            assert_eq!(buffered.read_buf.capacity(), 0);
+            buffered.read_buf.extend_from_slice(b"GET /partial");
+            assert!(buffered.poll_read_from_io(cx).is_pending());
+            assert_eq!(buffered.read_buf.as_ref(), b"GET /partial");
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[test]
+    fn small_tail_of_oversized_read_is_not_pooled() {
+        let mock = Mock::new().build();
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(mock));
+        buffered.read_buf.extend_from_slice(&[0; 65536]);
+        buffered.read_buf_poolable = false;
+        buffered.read_buf.advance(65536 - 1024);
+        buffered.read_buf.clear();
+        assert_eq!(buffered.read_buf.capacity(), 1024);
+        buffered.recycle_empty_read_buffer();
+        assert_eq!(buffered.read_buf.capacity(), 0);
+        assert!(buffered.read_buf_poolable);
+        assert_eq!(super::super::pool::take_read().capacity(), 0);
+    }
+
+    #[test]
+    fn completed_scalar_write_releases_storage_but_partial_write_keeps_bytes() {
+        let mut write_buf = WriteBuf::<Cursor<Vec<u8>>>::new(WriteStrategy::QueueScalar);
+        write_buf.headers_mut().bytes.extend_from_slice(b"headers");
+        write_buf.buffer(Cursor::new(b"body".to_vec()));
+        write_buf.advance(8);
+        assert_eq!(write_buf.chunk(), b"ody");
+        write_buf.advance(3);
+        assert_eq!(write_buf.remaining(), 0);
+        assert_eq!(write_buf.headers.bytes.capacity(), 0);
     }
 
     #[test]

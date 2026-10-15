@@ -28,7 +28,7 @@ The scalar queue is implemented in `src/proto/h1/io.rs`, forwarded through
 Scalar body queues leave the lazy write-header vector untouched, avoiding its
 previous 1,024-byte per-connection initial reserve.
 `BufList` now requests one element of deque capacity on its first queued body;
-the application returns `Full<Cursor<Vec<u8>>>` bodies as a single data buffer.
+the application returns `Full<Bytes>` bodies as a single data buffer.
 Further streamed buffers still use normal deque growth and preserve ordering.
 This is a structural allocation reduction, not yet a measured performance
 result.
@@ -45,3 +45,18 @@ configured maximum below 8,192 bytes. Additional tests cover scalar-write
 ordering, partial and pending writes, zero-write errors, pipeline-flush
 selection, and handler-future allocation and cleanup on success, error, and
 cancellation.
+
+Idle server connections return read buffers, scalar write-header vectors, and
+cached header maps to bounded thread-local pools. Each pool retains at most
+128 items; buffers above 8 KiB and header maps with capacity above 32 are not
+retained. Active connections reuse this storage, avoiding both per-connection
+idle capacity and repeated allocation on the normal small-request path.
+Scalar body deques retain their existing single-buffer slot for reuse.
+Empty reads at the initial adaptive size use a 1 KiB stack buffer, then acquire
+a pooled buffer only when bytes arrive. Larger adaptive reads keep the direct
+read path. Read allocation growth is tracked before splitting, so a small tail cannot
+return an oversized backing allocation to the pool. Partial headers, pipelined
+bytes, and pending writes retain their data. Tests check pool reuse and bounds, empty and partial Pending reads,
+partial and completed scalar writes, and cached-header cleanup on keep-alive.
+
+The local fork uses edition 2024 and the application's Rust 1.99 toolchain.

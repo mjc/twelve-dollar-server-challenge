@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::rt::{Read, Write};
 use bytes::{Buf, Bytes};
 use futures_core::ready;
-use http::header::{Entry, HeaderValue, CONNECTION};
+use http::header::{CONNECTION, Entry, HeaderValue};
 use http::{HeaderMap, Method, Version};
 use http_body::Frame;
 use httparse::ParserConfig;
@@ -528,7 +528,7 @@ where
 
         match self.state.reading {
             Reading::Continue(..) | Reading::Body(..) | Reading::KeepAlive | Reading::Closed => {
-                return
+                return;
             }
             Reading::Init => (),
         }
@@ -1142,6 +1142,12 @@ impl State {
 
         self.reading = Reading::Init;
         self.writing = Writing::Init;
+        if T::is_server() {
+            // Request header capacity otherwise follows every idle connection.
+            if let Some(headers) = self.cached_headers.take() {
+                super::pool::recycle_headers(headers);
+            }
+        }
 
         // !T::should_read_first() means Client.
         //
@@ -1182,6 +1188,22 @@ impl State {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "server")]
+    #[test]
+    fn idle_server_connection_releases_cached_headers() {
+        use super::*;
+        use crate::common::io::Compat;
+        let io = Compat(tokio_test::io::Builder::new().build());
+        let mut conn = Conn::<_, bytes::Bytes, crate::proto::h1::ServerTransaction>::new(io);
+        conn.state.cached_headers = Some(HeaderMap::with_capacity(128));
+        conn.state.reading = Reading::KeepAlive;
+        conn.state.writing = Writing::KeepAlive;
+        conn.state
+            .try_keep_alive::<crate::proto::h1::ServerTransaction>();
+        assert!(conn.state.is_idle());
+        assert!(conn.state.cached_headers.is_none());
+    }
+
     #[cfg(all(feature = "nightly", not(miri)))]
     #[bench]
     fn bench_read_head_short(b: &mut ::test::Bencher) {
@@ -1286,12 +1308,12 @@ mod tests {
 
     use super::*;
     use crate::common::io::Compat;
+    #[cfg(feature = "server")]
+    use crate::proto::RequestLine;
     #[cfg(feature = "client")]
     use crate::proto::h1::ClientTransaction;
     #[cfg(feature = "server")]
     use crate::proto::h1::ServerTransaction;
-    #[cfg(feature = "server")]
-    use crate::proto::RequestLine;
     use bytes::Bytes;
 
     fn poll_head<I, T>(

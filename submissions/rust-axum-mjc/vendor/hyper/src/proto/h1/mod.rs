@@ -17,6 +17,7 @@ mod decode;
 pub(crate) mod dispatch;
 mod encode;
 mod io;
+mod pool;
 mod role;
 
 cfg_client! {
