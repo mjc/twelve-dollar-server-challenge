@@ -204,20 +204,20 @@ retains full DWARF symbols with the release optimization settings. Rust and
 bundled SQLite preserve frame pointers. Run perf, heaptrack, or Pyroclast against
 that executable; deployment and recording scripts live in the shared devshell.
 
-### Ubuntu VM results
+### Ubuntu VM result
 
-These runs used Ubuntu 24.04 in a VM with one vCPU, 2 GiB RAM, no swap,
-ten listeners, a fresh supplied seed, a 32 MiB SQLite cache, and mmap disabled.
-The generator ran separately. Each run used a 60-second ramp, 60-second nominal
+The highest-throughput passing run used Ubuntu 24.04 in a VM with one vCPU,
+2 GiB RAM, no swap, ten listeners, a fresh supplied seed, a 32 MiB SQLite cache,
+and mmap disabled.
+The generator ran separately. The run used a 60-second ramp, 60-second nominal
 user hold, 30-second drain, and 10-second grace period, with CPU and whole-VM
 resource recording. Initial think time delays reaching the full TCP count.
 
-| Users | Capture | Requests | Errors | p95 / p99 | Hold app CPU | Hold whole-VM CPU |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 235,000 | Normal, earlier server revision | 2,783,678 | 0 | 398.55 / 708.28 ms | 86.33% | 93.92% |
-| 240,000 | Request-phase counters and timing logs, last profiled server revision | 2,849,999 | 0 | 478.15 / 618.25 ms | 78.38% | 85.54% |
+| Users | Hold requests/s | Requests | Errors | p95 / p99 | Hold app CPU | Hold whole-VM CPU |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 240,000 | 25,333 | 2,849,999 | 0 | 478.15 / 618.25 ms | 78.38% | 85.54% |
 
-Both completed ramp, hold, and drain and passed the latency and error thresholds.
+It completed ramp, hold, and drain and passed the latency and error thresholds.
 At 240,000 users, hold throughput was 25,333 requests/s, sampled peak app RSS was
 129.68 MiB, and peak whole-VM used memory was 1,274.10 MiB, measured as
 `MemTotal - MemAvailable`. Whole-VM CPU and memory include the OS and observer.
@@ -229,15 +229,9 @@ latency thresholds. This passing capture does not establish a repeatable
 responses clustered near the ramp-to-hold transition; identifying the blocked
 SQL-worker operation remains unfinished.
 
-Keeping edge-triggered socket watches installed removed idle-return rearming
-calls. In one earlier 240,000-user comparison, sampled reactor CPU fell from
-35.29 to 32.19 seconds per hold while throughput stayed near 25,350 requests/s.
-Both runs failed latency thresholds, and their VM/storage histories differed;
-the measured CPU reduction is not evidence of a latency fix.
-
-These measurements precede the switch to pinned dependency forks and the
+This measurement precedes the switch to pinned dependency forks and the
 Tokio 1.53.3 / serde_json 1.0.154 update; the updated build has not been
-capacity-benchmarked. These one-minute holds do not establish the five-minute
+capacity-benchmarked. This one-minute hold does not establish the five-minute
 contest result.
 
 ### Host systemd results
