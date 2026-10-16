@@ -115,7 +115,7 @@ foreign-key checks; post existence is queried only for duplicates and foreign-ke
 failures.
 
 Dependencies: Rust stable, Axum 0.8.9, Mio 1.2.4, rusqlite 0.40.2 with bundled SQLite,
-jsonwebtoken 11.1.0, Divan 0.1.21, Gungraun 0.20.0, and Mold 3.0.0.
+jsonwebtoken 11.1.0, and Mold 3.0.0.
 The bundled SQLite build disables optional global page-cache memory management
 through shared Cargo configuration, including the contest build.
 Private cache groups avoid its shared mutex while SQLite thread safety remains
@@ -166,9 +166,9 @@ slow commits, and checkpoint timing. It is disabled by default.
 
 ## Development
 
-Use an up-to-date Rust stable with rustfmt and Clippy. The instruction benchmarks
-require Gungraun runner 0.20.0 and Valgrind. Local shell setup and profiling orchestration
-are maintained outside this submission in the shared development configuration.
+Use an up-to-date Rust stable with rustfmt and Clippy. Local shell setup and
+profiling orchestration are maintained outside this submission in the shared
+development configuration.
 
 ```sh
 cargo fmt --check
@@ -178,21 +178,14 @@ mkdir -p target/test-runs
 TMPDIR="$PWD/target/test-runs" bash ../../test/run.sh .
 ```
 
-Tests cover endpoint status codes and response shapes, authentication, input
-validation, JSON escaping, durable writes, transaction rollback and cancellation,
-queue admission, batch limits and feed snapshots, checkpoint behavior, and
-HTTP keep-alive, pipelining, HEAD responses, and graceful shutdown.
+Unit tests live in `src/tests/` and are included in their original modules only
+for test builds. They cover endpoint status codes and response shapes,
+authentication, input validation, JSON escaping, durable writes, transaction
+rollback and cancellation, queue admission, batch limits and feed snapshots,
+checkpoint behavior, and HTTP keep-alive, pipelining, HEAD responses, and
+graceful shutdown.
 
 ## Benchmarking and profiling
-
-```sh
-cargo bench --locked --jobs 1 --bench micro
-cargo bench --locked --jobs 1 --bench instructions
-```
-
-The microbenchmarks measure token verification, health, feed, post lookup, and
-likes against a fixed database fixture. Divan reports elapsed time; Gungraun
-reports instruction counts across the caller and SQLite worker.
 
 With the standalone benchmark repository checked out at
 `../twelve-dollar-benchmark`, run its existing launcher from the challenge

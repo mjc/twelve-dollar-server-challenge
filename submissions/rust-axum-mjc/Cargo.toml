@@ -28,21 +28,7 @@ hyper = { git = "https://github.com/mjc/hyper.git", rev = "aaf16f787d264aa967e35
 tokio = { git = "https://github.com/mjc/tokio.git", rev = "30fa5746845ea20c8908134ee72ac6f43ecc76ac" }
 
 [dev-dependencies]
-divan = "=0.1.21"
-gungraun = { version = "=0.20.0", features = ["act"] }
 tempfile = "=3.27.0"
-
-[[bench]]
-name = "micro"
-harness = false
-
-[[bench]]
-name = "instructions"
-harness = false
-
-[profile.bench]
-debug = 2
-strip = false
 
 [profile.release]
 debug = false          # No debug symbols for smaller binaries
