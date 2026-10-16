@@ -14,7 +14,7 @@ On Linux, idle connections instead keep a standard TCP socket and service handle
 in a shared map. One epoll instance reports activity through a single Tokio
 registration; the server does not scan all idle sockets.
 
-The [Hyper fork](https://github.com/mjc/hyper/blob/aaf16f787d264aa967e357b07a5781f593d5f230/LOCAL-PATCHES.md)
+The [Hyper patches](https://github.com/hyperium/hyper/compare/master...mjc:hyper:benchmark-patches)
 can finish a response and return the still-open socket without retaining the
 HTTP session. Partial requests, pipelined bytes, pending handlers and unfinished
 writes stay active. Once that work has finished, the server drops the HTTP state
@@ -82,7 +82,7 @@ The Hyper patches also reduce allocations inside HTTP itself:
 Rust allocations use jemalloc with background decay after heap inspection found
 freed allocations still occupying resident memory. SQLite's C allocations keep
 the system allocator. The
-[Tokio fork](https://github.com/mjc/tokio/blob/30fa5746845ea20c8908134ee72ac6f43ecc76ac/LOCAL-PATCHES.md)
+[Tokio patch](https://github.com/tokio-rs/tokio/compare/master...mjc:tokio:benchmark-patches)
 reserves 64 KiB for the current-thread runtime's ready queue at startup, before
 connection allocation churn. That queue can still grow.
 
