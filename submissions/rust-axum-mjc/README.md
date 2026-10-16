@@ -265,6 +265,19 @@ This is one run per observer build; the paced retry started from a clean VM,
 while the earlier run followed lower rungs. The five-minute contest result is
 still pending.
 
+At 240,000 users, keeping edge-triggered socket watches installed removed the
+idle-return rearming calls. Sampled reactor CPU during the 60-second hold fell
+from 35.29 to 32.19 CPU seconds, while SQLite stayed near 15.3 seconds. Guest
+counters put app CPU at 86.18% before and 80.40% after, with hold throughput
+almost unchanged at 25,344 and 25,370 requests/s.
+
+Both runs failed the latency limits: p95/p99 were 604.06/774.90 ms before and
+743.60/1,058.84 ms after, with zero errors in either run. This is one run per
+build. The retry started from a clean VM after compilation; the earlier run
+followed lower loads. The retry also recorded more page faults, reclaim and
+socket-buffer pressure. The removed CPU cost is measured; the remaining tail
+latency and its storage-history differences are unresolved.
+
 ### Earlier capacity measurements
 
 The same optimized binary and ten listeners produced:
