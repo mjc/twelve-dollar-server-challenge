@@ -19,13 +19,13 @@ rusqlite = { version = "=0.40.2", features = ["bundled", "hooks"] }
 jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["rust_crypto"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.151", features = ["raw_value"] }
-tokio = { version = "=1.53.2", features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+tokio = { version = "=1.53.3", features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 tikv-jemallocator = { version = "=0.7.0", features = ["background_threads"] }
 tower = { version = "=0.5.3", features = ["make", "util"] }
 
 [patch.crates-io]
-hyper = { path = "vendor/hyper" }
-tokio = { path = "vendor/tokio" }
+hyper = { git = "https://github.com/mjc/hyper.git", rev = "aaf16f787d264aa967e357b07a5781f593d5f230" }
+tokio = { git = "https://github.com/mjc/tokio.git", rev = "30fa5746845ea20c8908134ee72ac6f43ecc76ac" }
 
 [dev-dependencies]
 divan = "=0.1.21"

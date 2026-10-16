@@ -718,6 +718,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 [[package]]
 name = "hyper"
 version = "1.12.0"
+source = "git+https://github.com/mjc/hyper.git?rev=aaf16f787d264aa967e357b07a5781f593d5f230#aaf16f787d264aa967e357b07a5781f593d5f230"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1557,7 +1558,8 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.53.3"
+source = "git+https://github.com/mjc/tokio.git?rev=30fa5746845ea20c8908134ee72ac6f43ecc76ac#30fa5746845ea20c8908134ee72ac6f43ecc76ac"
 dependencies = [
  "bytes",
  "libc",

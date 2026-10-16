@@ -24,10 +24,10 @@ There are at most 8,192 active sessions and one shared epoll descriptor. Active
 entries retain kernel storage until close or shutdown.
 Hyper uses Tokio sockets through its native adapter while active, avoiding a
 second transport buffer and boxed completion-I/O futures for reads and flushes.
-The vendored Hyper 1.12.0 starts HTTP/1 reads at 1 KiB and allocates response
+The pinned Hyper 1.12.0 fork starts HTTP/1 reads at 1 KiB and allocates response
 header storage when needed. Its configured minimum and default maximum remain
 8 KiB and 417,792 bytes; request-size limits are unchanged. The upstream source
-and local patch are documented in [vendor/hyper/LOCAL-PATCHES.md](vendor/hyper/LOCAL-PATCHES.md).
+and local patches are documented in the [Hyper fork](https://github.com/mjc/hyper/blob/aaf16f787d264aa967e357b07a5781f593d5f230/LOCAL-PATCHES.md).
 A bounded queue keeps database
 work off the HTTP event loop. Up to 4,096 jobs occupy channel slots, with at most
 1,024 dequeued jobs in either a mixed write batch or a read batch. Collection ends
@@ -87,10 +87,10 @@ vectors without copying.
 
 Rust allocations use jemalloc with background decay. SQLite's C allocations
 keep the system allocator.
-The vendored Tokio 1.53.2 reserves 64 KiB for its current-thread ready queue
+The pinned Tokio 1.53.3 fork reserves 64 KiB for its current-thread ready queue
 when the runtime starts. The queue can still grow; the initial reserve avoids
 growing it among connection allocations during load. See
-[vendor/tokio/LOCAL-PATCHES.md](vendor/tokio/LOCAL-PATCHES.md).
+[Tokio fork patches](https://github.com/mjc/tokio/blob/30fa5746845ea20c8908134ee72ac6f43ecc76ac/LOCAL-PATCHES.md).
 
 Post text, timestamps, and authors borrow SQLite row values while serializing.
 Single-post and fallback feed queries write directly into response bytes.
@@ -222,7 +222,7 @@ resource recording. Initial think time delays reaching the full TCP count.
 | Users | Capture | Requests | Errors | p95 / p99 | Hold app CPU | Hold whole-VM CPU |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | 235,000 | Normal, earlier server revision | 2,783,678 | 0 | 398.55 / 708.28 ms | 86.33% | 93.92% |
-| 240,000 | Request-phase counters and timing logs, current server | 2,849,999 | 0 | 478.15 / 618.25 ms | 78.38% | 85.54% |
+| 240,000 | Request-phase counters and timing logs, last profiled server revision | 2,849,999 | 0 | 478.15 / 618.25 ms | 78.38% | 85.54% |
 
 Both completed ramp, hold, and drain and passed the latency and error thresholds.
 At 240,000 users, hold throughput was 25,333 requests/s, sampled peak app RSS was
@@ -242,7 +242,10 @@ calls. In one earlier 240,000-user comparison, sampled reactor CPU fell from
 Both runs failed latency thresholds, and their VM/storage histories differed;
 the measured CPU reduction is not evidence of a latency fix.
 
-These one-minute holds do not establish the five-minute contest result.
+These measurements precede the switch to pinned dependency forks and the
+Tokio 1.53.3 update; the updated build has not been
+capacity-benchmarked. These one-minute holds do not establish the five-minute
+contest result.
 
 ### Earlier capacity measurements
 

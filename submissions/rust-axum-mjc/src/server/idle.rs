@@ -48,9 +48,13 @@ impl<S> IdleSockets<S> {
         }
         // SAFETY: the successful call created this FD; no other owner exists.
         let epoll = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: this private registration retains the same OwnedFd until
+        // drop. No code closes or replaces it; the readiness callback only
+        // borrows its descriptor for epoll_wait.
+        let readiness = unsafe { AsyncFd::register(epoll) }?;
         Ok(Self {
             connections: HashMap::new(),
-            readiness: AsyncFd::new(epoll)?,
+            readiness,
             next_token: 0,
         })
     }
