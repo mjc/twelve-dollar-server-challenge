@@ -235,16 +235,31 @@ Continuing that build in 5,000-user steps produced:
 | 170,000 | Original | Pass | 476.42 / 537.59 ms | 0 | 92.35% |
 | 175,000 | Original | Fail: p95 above 500 ms | 553.64 / 727.06 ms | 0 | 92.44% |
 | 175,000 | Separate, slower descriptor census | Pass | 433.79 / 569.73 ms | 0 | 71.22% |
+| 195,000 | Separate, slower descriptor census | Fail: p95 above 500 ms | 585.94 / 868.79 ms | 0 | 81.91% |
+| 195,000 | Census work paced in small slices | Pass | 30.46 / 296.57 ms | 0 | 72.19% |
 
-The observer used about 28% of the VM's only CPU in both runs, already included
-in the whole-VM totals. Each census dumped the socket table and resolved every
-process descriptor, taking about 645 ms of CPU per cycle at 175,000 users.
+The original observer used about 28% of the VM's only CPU at 170,000 and 175,000
+users, already included in the whole-VM totals. Each census dumped the socket
+table and resolved every process descriptor, taking about 645 ms of CPU per
+cycle at 175,000 users.
 The repeat kept the server executable and generator unchanged. Observer CPU fell
 to 5.91%, with CPU/RSS sampling still at 1 Hz and exact descriptor/socket counts
 reported only for newly completed scans. It passed without errors, but the
 remaining high p95 means census bursts may still affect latency. The retry used
 a clean VM rather than the earlier ladder's disk history; this is one comparison,
 not proof that all latency or storage stalls are fixed.
+
+At 195,000 users, the slower censuses still caused CPU bursts: the observer's
+largest one-second hold interval used 48.97% of one core. Pacing census work
+with a 1 ms wall-work target and rest equal to nine times measured work reduced
+that maximum to 9.00%, and observer hold CPU from 7.21% to 3.25%. Hold throughput
+was 20,321 versus 20,574 requests/s, with the server and generator unchanged.
+CPU/RSS samples stayed at 1 Hz; three newly completed censuses supplied counts,
+with null count fields on the other samples. The longest measured work slice
+was still 40.69 ms: this is cooperative pacing, not a hard time limit.
+This is one run per observer build; the paced retry started from a clean VM,
+while the earlier run followed lower rungs. The five-minute contest result is
+still pending.
 
 ### Earlier capacity measurements
 
