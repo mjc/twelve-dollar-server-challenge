@@ -243,7 +243,7 @@ Both runs failed latency thresholds, and their VM/storage histories differed;
 the measured CPU reduction is not evidence of a latency fix.
 
 These measurements precede the switch to pinned dependency forks and the
-Tokio 1.53.3 update; the updated build has not been
+Tokio 1.53.3 / serde_json 1.0.154 update; the updated build has not been
 capacity-benchmarked. These one-minute holds do not establish the five-minute
 contest result.
 
