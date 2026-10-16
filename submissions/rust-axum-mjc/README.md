@@ -240,21 +240,43 @@ Tokio 1.53.3 / serde_json 1.0.154 update; the updated build has not been
 capacity-benchmarked. These one-minute holds do not establish the five-minute
 contest result.
 
-### Earlier capacity measurements
+### Host systemd results
 
-The same optimized binary and ten listeners produced:
+The host systemd service was set up to explore the difference between service
+resource limits and running the server inside a VM. The service had a configured
+one-core CPU quota and a 2,147,483,648-byte memory limit. Its memory budget
+included the server, kernel socket memory and file cache; the host OS remained
+outside it. The load generator ran on a separate machine.
 
-| Connections | SQLite cache | Hold requests/s | p95 / p99 | Errors | Peak server RSS | Hold CPU, one core = 100% |
+The highest user count that passed the latency and error thresholds in this
+setup was 500,000, with two completed runs of the same frozen executable:
+
+| Run | Requests | Errors | Hold requests/s | p95 / p99 | Peak app RSS | Hold service CPU |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 400,000 | 256 MiB | 42,195 | 5.50 / 25.77 ms | 0 | 244.22 MiB | 96.14% |
-| 450,000 | 256 MiB | 47,509 | 4.71 / 50.13 ms | 0 | 329.65 MiB | 106.86% |
-| 500,000 | 32 MiB | 52,635 | 74.05 / 564.41 ms | 0 | 191.44 MiB | 130.02% |
+| First 500k pass | 5,966,831 | 0 | 52,670 | 48.82 / 63.83 ms | 99.76 MiB | 120.66% |
+| Profiled 500k repeat | 5,964,750 | 0 | 52,678 | 51.42 / 462.23 ms | 108.67 MiB | 119.97% |
 
-All runs completed ramp, hold, and drain without errors or OOM. Each used a
-60-second nominal user hold; initial user think time delays reaching the full
-TCP count. CPU, memory, and I/O profilers were on.
-The application cgroup limit was 2,147,483,648 bytes, including kernel memory,
-socket buffers, and file cache. These measurements do not establish the
-five-minute, whole-system 2 GB / one-vCPU contest result. In particular, the
-450,000- and 500,000-connection runs used more than one core while profiled, and enforcement
-of the configured CPU quota was not verified.
+Both used ten listeners, a 32 MiB SQLite cache, mmap disabled, the 8,192-active
+connection limit, and CPU/memory/I/O recording. The executable SHA-256 was
+`9f573cd70ee792cddc9dad80b0d51db4d4ada302022cc1977a93d75f114759bb`.
+The preserved Rust generator and observer hashes started with `5adb671f` and
+`27bfb0bc`. Workload starts were 2026-10-15 16:40:02.584778443 UTC and
+16:57:45.221453242 UTC, respectively.
+
+Each run completed a 60-second ramp, 60-second nominal user hold, 30-second
+drain and 10-second grace period. The generator sampled all 500,000 TCP
+connections live over spans of 53.466 and 51.560 seconds during those holds.
+Initial user think time delays the full connection count; these are not
+60-second measurements with every socket live throughout. The profiled repeat's
+sampled cgroup memory peaked at 2,147,479,552 bytes during hold, including kernel
+memory and file cache. App RSS is only the process portion of that budget.
+
+CPU percentages are relative to one core. Despite `cpu.max=100000 100000`, the
+service used about 1.2 cores during hold. Quota enforcement was not established
+under the host scheduler. A later 510,000-user attempt reached that count but
+was OOM-killed during drain and failed the error threshold.
+
+The systemd and VM runs show the two setups' observed results, but do not isolate
+VM overhead: server revisions, recording and the scope of the resource limits
+also differed. They precede the dependency refresh and do not establish a
+five-minute contest result inside a one-vCPU, whole-system 2 GB VM.
