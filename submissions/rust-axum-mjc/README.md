@@ -10,9 +10,13 @@ the response, the socket and service return to idle storage. Partial requests,
 pipelined input, pending handlers, and unfinished writes stay active.
 Each accepted connection receives a token that is never reused, so a stale
 readiness event cannot select a new connection that reused its file descriptor.
-Its one-shot epoll entry stays disabled while the socket is active. Returning to
-idle rearms the same entry with MOD, which checks readiness again after any
-temporary Tokio registration has ended. Closing a socket removes its entry.
+Its edge-triggered epoll entry stays installed while the socket is active,
+avoiding a rearm syscall on each return to idle. Notifications received during
+active work are remembered in the bounded active set. At handoff, a pending
+notification gets a nonblocking peek: unread data reactivates the connection,
+EOF closes it, and an empty socket returns to idle. This prevents a stale
+notification from retaining an idle socket as an active HTTP session. Closing
+a socket removes its entry.
 The idle map's key holds the token; only active sessions carry another copy.
 Active sessions have separate Tokio tasks and scheduling budgets. Readiness
 batches contain at most 1,024 events; the server does not scan idle sockets.

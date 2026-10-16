@@ -21,7 +21,7 @@ use tokio::{
     io::unix::AsyncFd,
     net::TcpListener,
     sync::watch,
-    task::JoinSet,
+    task::{Id, JoinSet},
     time::{Instant, MissedTickBehavior},
 };
 
@@ -56,38 +56,38 @@ impl<S> IdleSockets<S> {
     }
 
     fn push(&mut self, connection: IdleConnection<S>, token: Option<u64>) -> io::Result<()> {
-        let (token, operation) = match token {
-            Some(token) => (token, libc::EPOLL_CTL_MOD),
+        let token = match token {
+            Some(token) => token,
             None => {
                 let token = self.next_token;
                 self.next_token = token
                     .checked_add(1)
                     .ok_or_else(|| io::Error::other("idle socket token space exhausted"))?;
-                (token, libc::EPOLL_CTL_ADD)
+                // A token is allocated once per accepted socket and never
+                // reused, even after the OS reuses the socket's file descriptor.
+                let mut event = libc::epoll_event {
+                    events: (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLET) as u32,
+                    u64: token,
+                };
+                // SAFETY: both FDs are owned and live throughout this synchronous call.
+                // epoll_ctl copies the initialized event; it does not retain its address.
+                let result = unsafe {
+                    libc::epoll_ctl(
+                        self.readiness.get_ref().as_raw_fd(),
+                        libc::EPOLL_CTL_ADD,
+                        connection.stream.as_raw_fd(),
+                        &mut event,
+                    )
+                };
+                if result < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                token
             }
         };
-        // One-shot delivery disables this entry while the socket is active.
-        // MOD rearms the same entry and rechecks current readiness, including
-        // bytes that arrived before returning from Hyper or Tokio into std.
-        let mut event = libc::epoll_event {
-            events: (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLONESHOT) as u32,
-            u64: token,
-        };
-        // SAFETY: both FDs are owned and live throughout this synchronous call.
-        // epoll_ctl copies the initialized event; it does not retain its address.
-        let result = unsafe {
-            libc::epoll_ctl(
-                self.readiness.get_ref().as_raw_fd(),
-                operation,
-                connection.stream.as_raw_fd(),
-                &mut event,
-            )
-        };
-        if result < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // Tokens follow their socket through active ownership and are never
-        // reused for another socket, even when the OS reuses a closed FD.
+        debug_assert!(!self.connections.contains_key(&token));
+        // ET registrations stay enabled while a socket is active. A readiness
+        // edge copied while active is remembered and checked before re-parking.
         self.connections.insert(token, connection);
         Ok(())
     }
@@ -122,8 +122,7 @@ impl<S> IdleSockets<S> {
     }
 
     fn take_ready(&mut self, token: u64) -> Option<IdleConnection<S>> {
-        // Removing the sole idle owner also makes duplicate/stale events inert.
-        // The one-shot kernel entry stays disabled until that owner comes back.
+        // Removing the sole idle owner makes duplicate/stale events inert.
         self.connections.remove(&token)
     }
 
@@ -139,20 +138,18 @@ where
     S: Service<Request<Incoming>, Response = Response, Error = Infallible>,
 {
     http: Option<http1::Connection<TokioIo<Socket>, S>>,
-    token: u64,
 }
 
 impl<S> ActiveConnection<S>
 where
     S: Service<Request<Incoming>, Response = Response, Error = Infallible>,
 {
-    fn new(connection: IdleConnection<S>, token: u64, builder: &http1::Builder) -> Self {
+    fn new(connection: IdleConnection<S>, builder: &http1::Builder) -> Self {
         Self {
             http: Some(builder.serve_connection(
                 TokioIo::new(Socket::new(connection.stream)),
                 connection.service,
             )),
-            token,
         }
     }
 
@@ -167,7 +164,7 @@ impl<S> Future for ActiveConnection<S>
 where
     S: Service<Request<Incoming>, Response = Response, Error = Infallible>,
 {
-    type Output = io::Result<Option<(u64, IdleConnection<S>)>>;
+    type Output = io::Result<Option<IdleConnection<S>>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -186,19 +183,125 @@ where
                 // Hyper only yields idle when no partial/pipelined input remains.
                 debug_assert!(parts.read_buf.is_empty());
                 parts.io.into_inner().into_std().map(|stream| {
-                    Some((
-                        this.token,
-                        IdleConnection {
-                            stream,
-                            service: parts.service,
-                        },
-                    ))
+                    Some(IdleConnection {
+                        stream,
+                        service: parts.service,
+                    })
                 })
             }
             Ok(false) => Ok(None),
             Err(error) => Err(io::Error::other(error)),
         })
     }
+}
+
+struct ActiveTask {
+    id: Id,
+    pending_edge: bool,
+}
+
+fn spawn_active<S>(
+    active: &mut JoinSet<(u64, io::Result<Option<IdleConnection<S>>>)>,
+    active_tasks: &mut HashMap<u64, ActiveTask>,
+    connection: IdleConnection<S>,
+    token: u64,
+    builder: &http1::Builder,
+    stop: &watch::Sender<bool>,
+) where
+    S: Service<Request<Incoming>, Response = Response, Error = Infallible> + Send + 'static,
+    S::Future: Send + 'static,
+{
+    let mut connection = ActiveConnection::new(connection, builder);
+    let mut shutdown = stop.subscribe();
+    let handle = active.spawn(async move {
+        let result = tokio::select! {
+            result = &mut connection => result,
+            _ = shutdown.changed() => {
+                connection.shutdown();
+                connection.await
+            }
+        };
+        (token, result)
+    });
+    active_tasks.insert(
+        token,
+        ActiveTask {
+            id: handle.id(),
+            pending_edge: false,
+        },
+    );
+}
+
+fn remove_active_by_id(active_tasks: &mut HashMap<u64, ActiveTask>, id: Id) -> Option<u64> {
+    let token = active_tasks
+        .iter()
+        .find_map(|(token, task)| (task.id == id).then_some(*token))?;
+    active_tasks.remove(&token);
+    Some(token)
+}
+
+fn peek_nonblocking(stream: &TcpStream) -> io::Result<PeekResult> {
+    // Accepted Tokio streams and Tokio's into_std preserve nonblocking mode.
+    let mut byte = [0; 1];
+    loop {
+        match stream.peek(&mut byte) {
+            Ok(0) => return Ok(PeekResult::Closed),
+            Ok(_) => return Ok(PeekResult::Readable),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(PeekResult::WouldBlock);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+enum PeekResult {
+    Readable,
+    WouldBlock,
+    Closed,
+}
+
+fn finish_active<S>(
+    idle: &mut IdleSockets<S>,
+    active: &mut JoinSet<(u64, io::Result<Option<IdleConnection<S>>>)>,
+    active_tasks: &mut HashMap<u64, ActiveTask>,
+    (token, result): (u64, io::Result<Option<IdleConnection<S>>>),
+    pending_edge: bool,
+    builder: &http1::Builder,
+    stop: &watch::Sender<bool>,
+) -> io::Result<()>
+where
+    S: Service<Request<Incoming>, Response = Response, Error = Infallible> + Send + 'static,
+    S::Future: Send + 'static,
+{
+    let connection = match result {
+        Ok(Some(connection)) => connection,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            eprintln!("connection failed: {error}");
+            return Ok(());
+        }
+    };
+
+    if pending_edge {
+        match peek_nonblocking(&connection.stream) {
+            Ok(PeekResult::Readable) => {
+                // The completed task freed one active slot. Keep ownership
+                // active because this already-consumed edge still has data.
+                spawn_active(active, active_tasks, connection, token, builder, stop);
+            }
+            Ok(PeekResult::WouldBlock) => idle.push(connection, Some(token))?,
+            Ok(PeekResult::Closed) => (),
+            Err(error) => eprintln!("connection failed: {error}"),
+        }
+    } else {
+        // No edge was consumed while active, so an edge queued by the kernel
+        // remains available after ownership returns to the idle map.
+        idle.push(connection, Some(token))?;
+    }
+
+    Ok(())
 }
 
 pub(super) async fn serve_many<S, F>(
@@ -219,6 +322,7 @@ where
     let mut idle = IdleSockets::new()?;
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; IDLE_READY_BATCH];
     let mut active = JoinSet::new();
+    let mut active_tasks: HashMap<u64, ActiveTask> = HashMap::new();
     let (stop, _) = watch::channel(false);
     let mut report = tokio::time::interval(Duration::from_secs(1));
     report.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -263,27 +367,33 @@ where
                 scan_us += elapsed;
                 max_scan_us = max_scan_us.max(elapsed);
                 for event in &events[..count] {
-                    if let Some(connection) = idle.take_ready(event.u64) {
+                    let token = event.u64;
+                    if let Some(task) = active_tasks.get_mut(&token) {
+                        task.pending_edge = true;
+                    } else if let Some(connection) = idle.take_ready(token) {
                         ready_count += 1;
-                        let mut connection = ActiveConnection::new(connection, event.u64, &builder);
-                        let mut shutdown = stop.subscribe();
                         // Each active connection needs its own Tokio
                         // cooperative budget. A FuturesUnordered shares
                         // its parent's budget across every HTTP future.
-                        active.spawn(async move {
-                            tokio::select! {
-                                result = &mut connection => result,
-                                _ = shutdown.changed() => {
-                                    connection.shutdown();
-                                    connection.await
-                                }
-                            }
-                        });
+                        spawn_active(
+                            &mut active,
+                            &mut active_tasks,
+                            connection,
+                            token,
+                            &builder,
+                            &stop,
+                        );
                     }
                 }
             },
             _ = report.tick() => {
-                if active.is_empty() { idle.release_empty_storage(); }
+                if active.is_empty() {
+                    debug_assert!(active_tasks.is_empty());
+                    idle.release_empty_storage();
+                    if idle.connections.is_empty() {
+                        active_tasks = HashMap::new();
+                    }
+                }
                 if timings && report_at.elapsed() >= Duration::from_secs(1) {
                     eprintln!("HTTP_CONNECTIONS {}", serde_json::json!({
                         "end_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
@@ -299,28 +409,60 @@ where
                     (scan_us, max_scan_us) = (0, 0);
                 }
             },
-            completed = active.join_next(), if !active.is_empty() => {
+            completed = active.join_next_with_id(), if !active.is_empty() => {
                 completed_count += 1;
                 match completed.expect("active connection missing") {
-                    Ok(Ok(Some((token, connection)))) => idle.push(connection, Some(token))?,
-                    Ok(Ok(None)) => {},
-                    Ok(Err(error)) => eprintln!("connection failed: {error}"),
-                    Err(error) => eprintln!("connection task failed: {error}"),
+                    Ok((task_id, (token, result))) => {
+                        if let Some(task) = active_tasks.remove(&token) {
+                            if task.id != task_id {
+                                eprintln!("active connection task id mismatch for token {token}");
+                            }
+                            finish_active(
+                                &mut idle,
+                                &mut active,
+                                &mut active_tasks,
+                                (token, result),
+                                task.pending_edge,
+                                &builder,
+                                &stop,
+                            )?;
+                        } else {
+                            eprintln!("active connection task missing for token {token}");
+                        }
+                    }
+                    Err(error) => {
+                        remove_active_by_id(&mut active_tasks, error.id());
+                        eprintln!("connection task failed: {error}");
+                    }
                 }
             },
         }
     }
     drop(listeners);
-    // Closing the shared epoll drops its disabled active entries. Active tasks
-    // own their sockets independently and can finish shutdown without rearming.
+    // Closing the shared epoll removes active registrations. Active tasks own
+    // their sockets independently and can finish shutdown without rearming.
     drop(idle);
     let _ = stop.send(true);
-    while let Some(result) = active.join_next().await {
+    while let Some(result) = active.join_next_with_id().await {
         match result {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => eprintln!("connection failed during shutdown: {error}"),
-            Err(error) => eprintln!("connection task failed during shutdown: {error}"),
+            Ok((task_id, (token, result))) => {
+                if let Some(task) = active_tasks.remove(&token)
+                    && task.id != task_id
+                {
+                    eprintln!(
+                        "active connection task id mismatch during shutdown for token {token}"
+                    );
+                }
+                if let Err(error) = result {
+                    eprintln!("connection failed during shutdown: {error}");
+                }
+            }
+            Err(error) => {
+                remove_active_by_id(&mut active_tasks, error.id());
+                eprintln!("connection task failed during shutdown: {error}");
+            }
         }
     }
+    debug_assert!(active_tasks.is_empty());
     Ok(())
 }
