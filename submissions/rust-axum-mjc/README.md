@@ -211,72 +211,38 @@ retains full DWARF symbols with the release optimization settings. Rust and
 bundled SQLite preserve frame pointers. Run perf, heaptrack, or Pyroclast against
 that executable; deployment and recording scripts live in the shared devshell.
 
-### Ubuntu VM comparison
+### Ubuntu VM results
 
-These 125,000-user runs used Ubuntu 24.04 with one vCPU, 2 GiB RAM, no swap,
-ten listeners, a 32 MiB SQLite cache, and mmap disabled. Each used a fresh seed,
-a 60-second ramp, 60-second nominal user hold, 30-second drain and 10-second
-grace period, with the normal observer and 99 Hz CPU profile.
+These runs used Ubuntu 24.04 in a VM with one vCPU, 2 GiB RAM, no swap,
+ten listeners, a fresh supplied seed, a 32 MiB SQLite cache, and mmap disabled.
+The generator ran separately. Each run used a 60-second ramp, 60-second nominal
+user hold, 30-second drain, and 10-second grace period, with CPU and whole-VM
+resource recording. Initial think time delays reaching the full TCP count.
 
-| Build | Run p95 / p99 | HTTP errors | Hold app CPU | Hold whole-VM CPU |
-| --- | ---: | ---: | ---: | ---: |
-| Before (`1ae2cc4`) | 173.23 / 1,363.31 ms | 5,144 (0.346%) | 52.82% | 78.16% |
-| Three changes together (`85bde84`) | 3.64 / 17.95 ms | 0 | 37.37% | 64.58% |
+| Users | Capture | Requests | Errors | p95 / p99 | Hold app CPU | Hold whole-VM CPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 235,000 | Normal, earlier server revision | 2,783,678 | 0 | 398.55 / 708.28 ms | 86.33% | 93.92% |
+| 240,000 | Request-phase counters and timing logs, current server | 2,849,999 | 0 | 478.15 / 618.25 ms | 78.38% | 85.54% |
 
-Hold throughput was about 13,210 and 13,206 requests/s respectively. Reported
-hold CPU and throughput imply about 40.0 versus 28.3 microseconds of app CPU per
-request. The three changes were vectored response writes, the range feed query,
-and persistent epoll entries. This is one run per build, with no measurement of
-each change separately. The earlier run followed a ladder of lower loads; the
-new run started from a clean VM. The earlier errors coincided with I/O wait
-during ramp, so this comparison does not establish that the storage stall is
-fixed. These one-minute holds do not establish the five-minute contest result.
+Both completed ramp, hold, and drain and passed the latency and error thresholds.
+At 240,000 users, hold throughput was 25,333 requests/s, sampled peak app RSS was
+129.68 MiB, and peak whole-VM used memory was 1,274.10 MiB, measured as
+`MemTotal - MemAvailable`. Whole-VM CPU and memory include the OS and observer.
 
-Continuing that build in 5,000-user steps produced:
+The 240,000-user capture added request-phase counters to the generator and
+enabled server timing logs on tmpfs. Normal runs with the same server had failed
+latency thresholds. This passing capture does not establish a repeatable
+240,000-user limit or show that intermittent queue stalls are fixed. Its slow
+responses clustered near the ramp-to-hold transition; identifying the blocked
+SQL-worker operation remains unfinished.
 
-| Users | Observer | Result | p95 / p99 | HTTP errors | Hold whole-VM CPU |
-| --- | --- | --- | ---: | ---: | ---: |
-| 170,000 | Original | Pass | 476.42 / 537.59 ms | 0 | 92.35% |
-| 175,000 | Original | Fail: p95 above 500 ms | 553.64 / 727.06 ms | 0 | 92.44% |
-| 175,000 | Separate, slower descriptor census | Pass | 433.79 / 569.73 ms | 0 | 71.22% |
-| 195,000 | Separate, slower descriptor census | Fail: p95 above 500 ms | 585.94 / 868.79 ms | 0 | 81.91% |
-| 195,000 | Census work paced in small slices | Pass | 30.46 / 296.57 ms | 0 | 72.19% |
+Keeping edge-triggered socket watches installed removed idle-return rearming
+calls. In one earlier 240,000-user comparison, sampled reactor CPU fell from
+35.29 to 32.19 seconds per hold while throughput stayed near 25,350 requests/s.
+Both runs failed latency thresholds, and their VM/storage histories differed;
+the measured CPU reduction is not evidence of a latency fix.
 
-The original observer used about 28% of the VM's only CPU at 170,000 and 175,000
-users, already included in the whole-VM totals. Each census dumped the socket
-table and resolved every process descriptor, taking about 645 ms of CPU per
-cycle at 175,000 users.
-The repeat kept the server executable and generator unchanged. Observer CPU fell
-to 5.91%, with CPU/RSS sampling still at 1 Hz and exact descriptor/socket counts
-reported only for newly completed scans. It passed without errors, but the
-remaining high p95 means census bursts may still affect latency. The retry used
-a clean VM rather than the earlier ladder's disk history; this is one comparison,
-not proof that all latency or storage stalls are fixed.
-
-At 195,000 users, the slower censuses still caused CPU bursts: the observer's
-largest one-second hold interval used 48.97% of one core. Pacing census work
-with a 1 ms wall-work target and rest equal to nine times measured work reduced
-that maximum to 9.00%, and observer hold CPU from 7.21% to 3.25%. Hold throughput
-was 20,321 versus 20,574 requests/s, with the server and generator unchanged.
-CPU/RSS samples stayed at 1 Hz; three newly completed censuses supplied counts,
-with null count fields on the other samples. The longest measured work slice
-was still 40.69 ms: this is cooperative pacing, not a hard time limit.
-This is one run per observer build; the paced retry started from a clean VM,
-while the earlier run followed lower rungs. The five-minute contest result is
-still pending.
-
-At 240,000 users, keeping edge-triggered socket watches installed removed the
-idle-return rearming calls. Sampled reactor CPU during the 60-second hold fell
-from 35.29 to 32.19 CPU seconds, while SQLite stayed near 15.3 seconds. Guest
-counters put app CPU at 86.18% before and 80.40% after, with hold throughput
-almost unchanged at 25,344 and 25,370 requests/s.
-
-Both runs failed the latency limits: p95/p99 were 604.06/774.90 ms before and
-743.60/1,058.84 ms after, with zero errors in either run. This is one run per
-build. The retry started from a clean VM after compilation; the earlier run
-followed lower loads. The retry also recorded more page faults, reclaim and
-socket-buffer pressure. The removed CPU cost is measured; the remaining tail
-latency and its storage-history differences are unresolved.
+These one-minute holds do not establish the five-minute contest result.
 
 ### Earlier capacity measurements
 
