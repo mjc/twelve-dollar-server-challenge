@@ -1,125 +1,163 @@
 # Rust / Axum submission
 
 The five challenge endpoints use a native Hyper service with Axum request
-extraction, a current-thread Tokio runtime, and one dedicated SQLite worker.
-On Linux, idle TCP connections keep a standard socket and their service handle
+extraction, a single-threaded Tokio event loop, and one dedicated SQLite worker.
+All listening ports share the same database and application state. The design
+keeps idle connections small and avoids allocating temporary objects for each
+request.
+
+## Keeping open connections small
+
+Most users spend time thinking between requests. Retaining a complete HTTP
+parser, buffers and task for each of those sockets exhausted the memory budget.
+On Linux, idle connections instead keep a standard TCP socket and service handle
 in a shared map. One epoll instance reports activity through a single Tokio
-registration. Hyper state, a Tokio socket registration, and a task exist only
-while a connection is active. After Hyper has finished the request and flushed
-the response, the socket and service return to idle storage. Partial requests,
-pipelined input, pending handlers, and unfinished writes stay active.
-Each accepted connection receives a token that is never reused, so a stale
-readiness event cannot select a new connection that reused its file descriptor.
-Its edge-triggered epoll entry stays installed while the socket is active,
-avoiding a rearm syscall on each return to idle. Notifications received during
-active work are remembered in the bounded active set. At handoff, a pending
-notification gets a nonblocking peek: unread data reactivates the connection,
-EOF closes it, and an empty socket returns to idle. This prevents a stale
-notification from retaining an idle socket as an active HTTP session. Closing
-a socket removes its entry.
-The idle map's key holds the token; only active sessions carry another copy.
-Active sessions have separate Tokio tasks and scheduling budgets. Readiness
-batches contain at most 1,024 events; the server does not scan idle sockets.
-There are at most 8,192 active sessions and one shared epoll descriptor. Active
-entries retain kernel storage until close or shutdown.
-Hyper uses Tokio sockets through its native adapter while active, avoiding a
-second transport buffer and boxed completion-I/O futures for reads and flushes.
-The pinned Hyper 1.12.0 fork starts HTTP/1 reads at 1 KiB and allocates response
-header storage when needed. Its configured minimum and default maximum remain
-8 KiB and 417,792 bytes; request-size limits are unchanged. The upstream source
-and local patches are documented in the [Hyper fork](https://github.com/mjc/hyper/blob/aaf16f787d264aa967e357b07a5781f593d5f230/LOCAL-PATCHES.md).
-A bounded queue keeps database
-work off the HTTP event loop. Up to 4,096 jobs occupy channel slots, with at most
-1,024 dequeued jobs in either a mixed write batch or a read batch. Collection ends
-when the batch fills or 1 ms after its first request. Read batches also stop at
-the next write.
-Requests wait up to 1 second, the benchmark p99 ceiling, to acquire a channel
-slot before receiving HTTP 503. Execution adds to that admission wait, so the
-ceiling is an overload cutoff rather than a latency guarantee.
-This admission timeout does not cancel database work that has already been
-queued. Canceled jobs are skipped before their SQL starts. SQLite uses the supplied schema and indexes, WAL,
-NORMAL synchronous mode, and cached prepared statements. Responses read current transaction data; writes commit before returning success. JWT signatures are verified
-on every authenticated request.
-Every request executes its own SQLite query, including feed requests in the
-same batch. Read batches retain prepared transaction-control statements. A failed
-commit rolls back before replies; if cleanup leaves a transaction open, the
-worker closes that connection.
+registration; the server does not scan all idle sockets.
 
-On Unix, both database connections use SQLite's
+The [Hyper fork](https://github.com/mjc/hyper/blob/aaf16f787d264aa967e357b07a5781f593d5f230/LOCAL-PATCHES.md)
+can finish a response and return the still-open socket without retaining the
+HTTP session. Partial requests, pipelined bytes, pending handlers and unfinished
+writes stay active. Once that work has finished, the server drops the HTTP state
+and returns the socket to idle storage. Keep-alive connections remain open.
+
+The server permits at most 8,192 active HTTP sessions. Each has its own Tokio
+task, giving it an independent scheduling budget. Readiness batches contain at
+most 1,024 events, and capacity is checked before consuming another batch.
+Connections start idle and acquire HTTP state only when data arrives.
+
+Each socket's edge-triggered epoll watch stays installed between requests,
+avoiding a rearm syscall on every return to idle. Tokens are never reused, so a
+stale event cannot select a replacement connection that reused a file descriptor.
+Notifications received during active work are remembered. Before parking again,
+a nonblocking peek distinguishes unread data, a closed peer and an empty socket.
+This prevents a stale notification from retaining an idle HTTP session or losing
+an arriving request.
+
+A socket is registered with Tokio only when a read or write actually has to wait.
+Waiting for a database reply alone does not require that registration. After
+registration, HTTP is polled again immediately to avoid missing a notification.
+The adapter adds no second transport buffer. Idle and active maps release their
+storage after all connections drain.
+
+## Avoiding temporary objects and copies
+
+Here, borrowing means using existing text while its owner still holds it,
+instead of allocating and copying another string.
+
+| Step | What changes, and why |
+| --- | --- |
+| Routing | The five routes are matched directly, avoiding the general Axum router and the adapter between Tower services and Hyper. Paths are borrowed; percent-encoded post IDs are decoded and checked in one pass without creating a decoded string. |
+| Handler state | Dispatch returns its existing asynchronous result directly, avoiding another wrapper that must retain the handler's state. Hyper allocates space for the handler only when a request arrives and releases it on completion. |
+| HTTP bodies | Requests retain Hyper's concrete body type. Only post creation uses Axum's body extractor and size limit. Responses use a single byte buffer, avoiding the allocation needed for a generic response-body wrapper. |
+| Headers | After authentication, request headers are cleared and their allocated table is reused for response headers. The empty table returns to Hyper's pool after encoding. |
+| Post input | Unescaped JSON text borrows the received bytes; trimming returns a slice. Escaped text reuses the decoder's allocation. Accepted requests are parsed once, without first constructing a general JSON object. Rejected type errors get the additional validation needed to preserve API error ordering. |
+| Authentication | The decoder reads the required claims without first constructing a general JSON object. Likes validate the username without keeping a copied string; creation keeps it because it appears in the response. Signatures are checked on every request. |
+| Post and feed JSON | Text fields borrow SQLite row values. Fixed keys and punctuation are written directly; serde_json encodes the values and handles escaping. Each row is serialized before advancing the query, avoiding a list of post objects and separate copies of their text fields. |
+| Output sizing | Feed, post and create responses remember the previous buffer capacity as a size hint. Each response owns new bytes; the hint avoids repeated growth without caching response data. |
+| HTTP output | The finished vector transfers ownership of its allocation to the response without copying. Headers and body remain separate buffers for vectored writes. Hyper's body queue initially reserves just one entry for these single-buffer responses. |
+| Feed assembly | Fixed-size arrays track selected IDs, like counts and serialized row offsets, avoiding a heap-allocated lookup map and list of post objects. Serialized segments are copied into their final order. |
+| Batch replies | Completion arrays are reused, and processing visits only the entries filled by the current batch. |
+| Queue admission | The worker queue reserves a slot before creating a reply channel. Canceled requests are skipped before SQL starts; a fully canceled write batch does not begin a transaction. |
+
+The Hyper patches also reduce allocations inside HTTP itself:
+
+- Adaptive reads start at 1 KiB rather than 8 KiB and can grow for larger input.
+  An empty small read first uses a 1 KiB stack buffer; heap storage is acquired
+  only when bytes arrive. The configured minimum and default maximum remain
+  8 KiB and 417,792 bytes; request-size limits are unchanged.
+- Response-header byte storage is allocated on first use. Read buffers,
+  write-header buffers and header tables return to bounded per-thread pools.
+  Each pool retains at most 128 items; buffers above 8 KiB and header tables
+  with capacity above 32 are discarded.
+- Read-buffer growth is tracked before splitting the buffer. A small slice at
+  the end of a large allocation cannot keep that whole allocation in the pool.
+- Server-only builds remove Hyper's per-connection header-cache field. The
+  shared pools last for the runtime's lifetime, including periods when every
+  HTTP session is parked.
+- Linux vectored writes send existing header and body buffers together without
+  copying them into a combined buffer. Partial and pending writes retain the
+  original bytes. Other platforms use scalar writes; pipeline flushing is
+  disabled. The separate performance effect of vectored writes is unmeasured.
+
+Rust allocations use jemalloc with background decay after heap inspection found
+freed allocations still occupying resident memory. SQLite's C allocations keep
+the system allocator. The
+[Tokio fork](https://github.com/mjc/tokio/blob/30fa5746845ea20c8908134ee72ac6f43ecc76ac/LOCAL-PATCHES.md)
+reserves 64 KiB for the current-thread runtime's ready queue at startup, before
+connection allocation churn. That queue can still grow.
+
+## Sharing database setup and commit costs
+
+A bounded queue keeps SQLite work off the HTTP event loop. It holds up to 4,096
+jobs. The worker collects up to 1,024 requests, stopping when full or 1 ms after
+the first request. The deadline does not restart for each arrival. Waiting uses
+park/unpark on the existing SQL thread, without another asynchronous runtime.
+
+Consecutive reads share one read transaction, ending at the next write. Each
+request still executes its own queries and gets its own response. A lone read
+avoids the batch transaction setup where possible. Feed queries retain a
+transaction because their multiple queries need a consistent snapshot.
+
+A write begins a mixed batch that preserves queue order. Reads in that batch see
+preceding writes. Per-write savepoints isolate failed writes, and all replies
+wait for the group commit. A failed commit rolls back before replies; if cleanup
+leaves a transaction open, the worker closes the connection. Canceling a reply
+after SQL executes does not undo the write. Read transactions finish before
+responses are sent, so a slow client does not keep a database snapshot open.
+
+Requests wait up to one second for a queue slot before receiving HTTP 503
+"database busy". This is a queue-admission timeout, not SQLite's lock error.
+Execution adds to that wait, so it is an overload cutoff rather than a latency
+guarantee. It does not cancel work already queued.
+
+Queries and transaction-control statements are prepared once, including BEGIN,
+COMMIT and savepoint operations. `SQLITE_PREPARE_PERSISTENT` keeps these long-lived
+statements out of SQLite's small-allocation lookaside reserve. Each connection
+has one owning thread and is opened without a per-connection mutex. SQLite
+retains thread support; the build disables optional global page-cache memory
+management to avoid its shared cache-group mutex. Private cache groups may use
+more memory.
+
+Post creation uses INSERT RETURNING for the ID and timestamp and reuses the
+validated request body and authenticated username in the response, avoiding a
+second read of the new row. A successful like relies on SQLite's foreign-key
+check rather than first querying whether the post exists. Duplicates and
+foreign-key failures take the extra lookup needed to preserve the API's errors.
+
+Each feed request finds the latest 20 post IDs in timestamp and ID order. If
+their checked ID span is below 256, prepared range queries count likes and read
+joined posts through the existing indexes. Fixed arrays restore the selected
+order. Sparse spans, arithmetic overflow and missing authors fall back to the
+original query, whose limit follows the join. The range path serializes into
+scratch storage, then copies row segments into the response; it is not an
+end-to-end zero-copy path. Scratch contents are cleared after each request,
+retaining at most 64 KiB of capacity. No post, token or query-result cache is used.
+The supplied schema and indexes are unchanged. The default SQLite page-cache
+target is 32 MiB, leaving more of the budget for kernel sockets and request bursts;
+mmap is disabled.
+
+## Avoiding storage stalls during traffic
+
+SQLite's automatic WAL checkpoint threshold is disabled. A separate connection
+checks once per second and starts a PASSIVE checkpoint only after the SQL worker
+has done no batch work for a full interval. When it has copied all committed WAL
+frames, it skips further checkpoints until new work arrives. New requests may
+still arrive during a checkpoint, and the WAL can grow during continuous load.
+
+With `journal_size_limit=0`, SQLite discards the unused tail on the first commit
+after a checkpointed WAL resets. Later writes extend the file, avoiding reads of
+cold old blocks needed for partial-page overwrites. Physical file size alone no
+longer triggers repeated checkpoints after the log has logically reset.
+
+On Unix, both connections use SQLite's
 [unix-excl filesystem backend](https://www.sqlite.org/vfs.html). The temporary
-index that locates pages in the WAL lives in process memory, so updating it
-avoids filesystem write faults in the `-shm` file. The SQL worker and checkpoint
-thread retain separate connections. Other SQLite processes must wait until the
-server releases the database lock. The database and WAL remain on disk, with
-NORMAL synchronization and successful write responses sent after commit.
-
-When the worker reaches a write, it collects up to 1,024 requests within the
-1 ms window and processes them in queue order in one transaction. Intervening reads share
-that transaction, and their responses wait for the same commit as the writes.
-Per-write savepoints isolate failed writes, while a failed group commit rolls back and
-fails the affected replies. Canceled requests are skipped before execution;
-canceling a response after execution does not undo its write.
-
-SQLite's automatic WAL checkpoint threshold is disabled. A dedicated worker
-checks once per second and starts a PASSIVE checkpoint only after the database
-worker has done no batch work for a full interval. It skips further checkpoints
-until more work arrives if the previous one copied all committed WAL frames.
-This moves checkpoint I/O out of sustained traffic. New requests can still
-arrive while a checkpoint is running. The WAL can grow during continuous load.
-With `journal_size_limit=0`, SQLite discards its unused tail on the first commit
-after a checkpointed WAL resets. Later writes extend the file, avoiding reads
-of cold old blocks needed for partial-page overwrites.
-Read transactions end before responses are sent, so a slow client does not
-keep a database snapshot open.
-
-Idle connections return read buffers, queued write-header vectors, and cached
-header maps to bounded per-thread pools for reuse by active connections. Each
-pool retains at most 128 items; byte buffers larger than 8 KiB and header maps
-with capacity above 32 are discarded. Small empty reads use a stack buffer until
-data arrives; partial requests and pending writes retain their bytes.
-Server-only builds keep header maps in these pools without reserving a header
-cache in every connection. The bounded pools last for the runtime's lifetime,
-so parking the last active HTTP session does not discard reusable buffers.
-The idle connection map releases its storage after all connections drain.
-
-HTTP response bodies use immutable `Bytes`, taking ownership of serialized
-vectors without copying.
-
-Rust allocations use jemalloc with background decay. SQLite's C allocations
-keep the system allocator.
-The pinned Tokio 1.53.3 fork reserves 64 KiB for its current-thread ready queue
-when the runtime starts. The queue can still grow; the initial reserve avoids
-growing it among connection allocations during load. See
-[Tokio fork patches](https://github.com/mjc/tokio/blob/30fa5746845ea20c8908134ee72ac6f43ecc76ac/LOCAL-PATCHES.md).
-
-Post text, timestamps, and authors borrow SQLite row values while serializing.
-Single-post and fallback feed queries write directly into response bytes.
-Unescaped request bodies reuse the HTTP buffer;
-escaped bodies reuse their decoded allocation. No post or token cache is used.
-Fixed JSON keys are appended as static bytes; serde_json encodes the values.
-The dispatcher keeps Hyper's concrete request body for routes that do not read
-it. Only post creation wraps the body for Axum's byte extractor and size limit.
-Response allocation sizes reuse the observed capacity for each query type.
-Each feed request discovers the latest 20 post IDs in timestamp and ID order.
-When their checked ID span is below 256, prepared range queries count likes in
-SQLite and read joined posts through the existing indexes. The response restores
-the selected ID order. Sparse spans, arithmetic overflow, and missing author
-joins use the original feed query, whose limit follows the join. All queries use
-the request's current transaction; no result survives between requests.
-The range path serializes into worker scratch storage, then copies those bytes
-into the response. Scratch contents are cleared on success, fallback, and error;
-at most 64 KiB of capacity is retained.
-The supplied schema and indexes are left unchanged. The request connection
-targets a 32 MiB SQLite page cache by default. Successful likes rely on SQLite's
-foreign-key checks; post existence is queried only for duplicates and foreign-key
-failures.
+index used to find pages in the WAL lives in process memory, avoiding filesystem
+write faults in the `-shm` file. The server needs exclusive access to the database.
+The database and WAL remain on disk with NORMAL synchronization, and successful
+write responses still wait for commit.
 
 Dependencies: Rust stable, Axum 0.8.9, Mio 1.2.4, rusqlite 0.40.2 with bundled SQLite,
 jsonwebtoken 11.1.0, and Mold 3.0.0.
-The bundled SQLite build disables optional global page-cache memory management
-through shared Cargo configuration, including the contest build.
-Private cache groups avoid its shared mutex while SQLite thread safety remains
-enabled; keeping pages per connection may increase memory use.
 
 ## Run
 
@@ -149,12 +187,7 @@ The profiling tasks can request a range with `BENCH_PORT=3100` and
 `BENCH_PORT_END=3105` in the private benchmark config. The load generator and
 health probe use the first port. A single `BENCH_PORT` keeps one listener.
 
-On Linux, HTTP/1 vectored writes borrow the queued header and body buffers in
-one syscall when possible. Partial and pending writes keep those buffers until
-the bytes drain; the header vector then returns to the bounded pool. Pipeline
-flushing is disabled. Other platforms keep scalar writes. This write strategy
-has not yet been compared with scalar writes under equivalent load. `READ_BATCHING`
-accepts `true` or `false` and defaults to `true`.
+`READ_BATCHING` accepts `true` or `false` and defaults to `true`.
 `SQLITE_MMAP_SIZE` sets the request connection's mmap size in bytes and defaults
 to `0`; startup reports both the requested and effective sizes.
 `SQLITE_PAGE_CACHE_KIB` sets the request connection's page-cache target in KiB
@@ -177,13 +210,6 @@ cargo nextest run --locked
 mkdir -p target/test-runs
 TMPDIR="$PWD/target/test-runs" bash ../../test/run.sh .
 ```
-
-Unit tests live in `src/tests/` and are included in their original modules only
-for test builds. They cover endpoint status codes and response shapes,
-authentication, input validation, JSON escaping, durable writes, transaction
-rollback and cancellation, queue admission, batch limits and feed snapshots,
-checkpoint behavior, and HTTP keep-alive, pipelining, HEAD responses, and
-graceful shutdown.
 
 ## Benchmarking and profiling
 
@@ -221,6 +247,12 @@ It completed ramp, hold, and drain and passed the latency and error thresholds.
 At 240,000 users, hold throughput was 25,333 requests/s, sampled peak app RSS was
 129.68 MiB, and peak whole-VM used memory was 1,274.10 MiB, measured as
 `MemTotal - MemAvailable`. Whole-VM CPU and memory include the OS and observer.
+Most of this memory is in the kernel, which tracks the open sockets and
+connections. At the peak whole-VM used-memory sample, unreclaimable kernel
+slab (kernel object storage that cannot be reclaimed while in use) alone
+occupied 770.06 MiB; app RSS at that same sample was 128.55 MiB.
+This kernel counter covers the whole guest; individual kernel object types
+were not attributed separately.
 
 The 240,000-user capture added request-phase counters to the generator and
 enabled server timing logs on tmpfs. Normal runs with the same server had failed
